@@ -4,70 +4,19 @@ import sqlite3
 import os
 import time
 from PIL import Image
-# 确保 path_utils.py 存在于同级目录
-from path_utils import load_workspace_config
 
-# --- 1. 动态获取数据目录 ---
-# 模块加载时尝试读取一次，但后续可能会变，所以这只是初始值
-DATA_DIR = load_workspace_config()
-
-# 辅助函数：获取最新的数据库路径
-def get_db_path():
-    # 重新从全局变量获取，或者再次读取配置确保最新
-    if DATA_DIR:
-        return os.path.join(DATA_DIR, "mortal_write.db")
-    # 如果全局变量为空，尝试重新读取
-    latest_path = load_workspace_config()
-    if latest_path:
-        return os.path.join(latest_path, "mortal_write.db")
-    return None
+# 【修改】引入 config 模块本身，而不是直接引入变量
+# 这样可以确保 main.py 中修改 config.DATA_DIR 后，这里能获取到最新值
+import config 
 
 class DatabaseManager:
     """管理 SQLite 数据库连接和操作"""
-    def __init__(self, db_file=None):
-        # 🔥 核心修复：优先使用传入的 db_file
-        # 如果未传入，则动态根据当前的 DATA_DIR 构建路径，而不是使用可能过期的模块级变量
-        if db_file:
-            self.db_file = db_file
-        else:
-            self.db_file = get_db_path()
-        
-        # 再次检查：如果是首次运行，可能模块变量还没更新
-        if not self.db_file:
-            # 尝试重新加载一次配置（防御性编程）
-            global DATA_DIR
-            DATA_DIR = load_workspace_config()
-            self.db_file = get_db_path()
-
-        if not self.db_file:
-            raise ValueError("数据库路径未初始化！请先配置工作区。")
-            
-        # 自动初始化目录结构（如果是首次运行且刚刚配置好）
-        self._ensure_directories()
-
+    def __init__(self, db_file):
         # check_same_thread=False 允许 Streamlit 多线程访问
-        self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.create_tables()
         self.migrate_tables() 
-        
-    def _ensure_directories(self):
-        """确保所有必要的子目录存在"""
-        # 重新获取最新的 DATA_DIR
-        current_data_dir = DATA_DIR or load_workspace_config()
-        
-        if current_data_dir:
-            if not os.path.exists(current_data_dir):
-                 try: os.makedirs(current_data_dir, exist_ok=True)
-                 except: pass
-                 
-            # 创建子目录列表
-            sub_dirs = ["images", "knowledge", "logs", "ideas", "projects", "html", "exports", "relations"]
-            for sub in sub_dirs:
-                path = os.path.join(current_data_dir, sub)
-                if not os.path.exists(path):
-                    try: os.makedirs(path, exist_ok=True)
-                    except: pass
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -98,17 +47,29 @@ class DatabaseManager:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
 
+        # 完整表结构定义
         cursor.execute('''CREATE TABLE IF NOT EXISTS characters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             book_id INTEGER, name TEXT, role TEXT, gender TEXT, 
             race TEXT, 
-            desc TEXT, avatar TEXT, is_major BOOLEAN DEFAULT 0
+            desc TEXT, avatar TEXT, is_major BOOLEAN,
+            
+            origin TEXT,            -- 出身
+            profession TEXT,        -- 职业
+            cheat_ability TEXT,     -- 金手指
+            power_level TEXT,       -- 境界
+            ability_limitations TEXT, -- 代价
+            appearance_features TEXT, -- 外貌特征
+            signature_sign TEXT,      -- 标志性物品
+            relationship_to_protagonist TEXT, -- 与主角关系
+            social_role TEXT,                 -- 社会角色
+            debts_and_feuds TEXT              -- 恩仇
         )''')
         
         cursor.execute('''CREATE TABLE IF NOT EXISTS plots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id INTEGER, name TEXT, desc TEXT, 
-            type TEXT, status TEXT, importance INTEGER DEFAULT 0, content TEXT,
+            book_id INTEGER, name TEXT, desc TEXT, content TEXT, 
+            type TEXT, status TEXT, importance INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
@@ -134,39 +95,68 @@ class DatabaseManager:
         cursor.close()
 
     def migrate_tables(self):
-        """自动迁移旧数据库结构"""
+        """自动迁移旧数据库结构 - 修复版"""
         cursor = self.conn.cursor()
         
-        # 定义需要检查的列及其类型
-        cols = [
-            ("books", "updated_at", "TIMESTAMP"),
-            ("volumes", "part_id", "INTEGER"),
-            ("characters", "race", "TEXT"),
-            ("characters", "desc", "TEXT"),
-            ("characters", "is_major", "BOOLEAN DEFAULT 0"),
-            ("characters", "avatar", "TEXT"),
-            ("plots", "content", "TEXT")
-        ]
-        
-        for table, col, type_ in cols:
-            try: 
-                # 尝试查询该列，如果报错说明列不存在
-                cursor.execute(f"SELECT {col} FROM {table} LIMIT 1")
-            except: 
-                try:
-                    # 添加列
-                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_}")
-                    self.conn.commit()
-                except Exception as e:
-                    print(f"Migrate Warning ({table}.{col}): {e}")
+        # --- 辅助函数：安全检查列是否存在 ---
+        def column_exists(table_name, column_name):
+            try:
+                # 查询表结构信息
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                # info[1] 是列名字段
+                columns = [info[1] for info in cursor.fetchall()] 
+                return column_name in columns
+            except Exception:
+                return False
 
+        # 1. 迁移 books 表
+        if not column_exists("books", "updated_at"):
+            try: cursor.execute("ALTER TABLE books ADD COLUMN updated_at TIMESTAMP")
+            except: pass
+
+        # 2. 迁移 volumes 表 (🔥 核心修复：防止 duplicate column name: part_id)
+        if not column_exists("volumes", "part_id"):
+            try: 
+                cursor.execute("ALTER TABLE volumes ADD COLUMN part_id INTEGER")
+                print("✅ 数据库迁移：已添加 volumes.part_id 列")
+            except Exception as e: print(f"Migration error (volumes.part_id): {e}")
+
+        # 3. 迁移 plots 表
+        if not column_exists("plots", "content"):
+            try: cursor.execute("ALTER TABLE plots ADD COLUMN content TEXT")
+            except: pass
+            
+        if not column_exists("plots", "importance"):
+            try: cursor.execute("ALTER TABLE plots ADD COLUMN importance INTEGER DEFAULT 0")
+            except: pass
+
+        # 4. 迁移 characters 表 (批量检查)
+        new_char_cols = {
+            "race": "TEXT", "desc": "TEXT", "is_major": "BOOLEAN DEFAULT 0", "avatar": "TEXT",
+            "origin": "TEXT", "profession": "TEXT", "cheat_ability": "TEXT", "power_level": "TEXT",
+            "ability_limitations": "TEXT", "appearance_features": "TEXT", "signature_sign": "TEXT",
+            "relationship_to_protagonist": "TEXT", "social_role": "TEXT", "debts_and_feuds": "TEXT"
+        }
+        
+        # 只有当 characters 表存在时才进行迁移检查
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='characters'")
+        if cursor.fetchone():
+            # 重新获取当前所有列，避免多次查询
+            cursor.execute("PRAGMA table_info(characters)")
+            existing_cols = {info[1] for info in cursor.fetchall()}
+            
+            for col, col_type in new_char_cols.items():
+                if col not in existing_cols:
+                    try: 
+                        cursor.execute(f"ALTER TABLE characters ADD COLUMN {col} {col_type}")
+                        print(f"✅ 数据库迁移：已添加 characters.{col} 列")
+                    except: pass
+        
+        self.conn.commit()
         cursor.close()
             
     def update_book_timestamp(self, book_id):
-        if book_id:
-            try:
-                self.execute("UPDATE books SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (book_id,))
-            except: pass
+        self.execute("UPDATE books SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (book_id,))
         
     def query(self, sql, params=()):
         c = self.conn.cursor()
@@ -195,26 +185,27 @@ class DatabaseManager:
         self.conn.close()
 
 def save_avatar_file(uploaded_file, char_id):
-    """保存头像到用户选择的数据目录下的 images 文件夹"""
+    """保存头像文件"""
     try:
         if uploaded_file is None: return None
-        
-        # 确保获取最新的 DATA_DIR
-        current_data_dir = DATA_DIR or load_workspace_config()
-        if not current_data_dir: return None 
-        
-        # 简单校验
         if hasattr(uploaded_file, 'type') and uploaded_file.type.startswith('image/'):
-            save_dir = os.path.join(current_data_dir, "images")
-            if not os.path.exists(save_dir): 
-                os.makedirs(save_dir)
+            img = Image.open(uploaded_file)
+            try:
+                img.verify() 
+            except Exception:
+                return None 
             
-            # 重新定位文件指针
             uploaded_file.seek(0)
             img = Image.open(uploaded_file)
             
+            # 【修改】使用 config.DATA_DIR 动态获取路径
+            images_dir = os.path.join(config.DATA_DIR, "images")
+            if not os.path.exists(images_dir): 
+                os.makedirs(images_dir)
+                
             file_name = f"char_{char_id}_{int(time.time())}.png"
-            save_path = os.path.join(save_dir, file_name)
+            save_path = os.path.join(images_dir, file_name)
+            
             img.save(save_path, 'PNG')
             return save_path
         return None
