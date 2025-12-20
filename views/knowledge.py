@@ -1,276 +1,623 @@
-
+# knowledge.py
 
 import streamlit as st
 import json
 import os
 import time
+import base64
+import html
+import re
 from datetime import datetime
 from utils import render_header, ensure_log_file, log_operation
 from logic import FEATURE_MODELS, MODEL_MAPPING
+from config import DATA_DIR 
 
 # ==============================================================================
-#  CSS 样式注入 (汉化上传组件 & 隐藏按钮)
+#  基础配置 & CSS 样式注入
 # ==============================================================================
+THEME_COLOR = "#2e7d32"
+THEME_LIGHT = "#e8f5e9"
+
+# 设定分类映射
+SETTING_TYPES = {
+    "Universe": "🌌 宇宙观/物理法则",
+    "Geography": "🏰 地理/地图/区域",
+    "TimeHistory": "📜 历史/纪年/时间线",
+    "PowerSystem": "📈 力量体系/超自然力",
+    "PoliticalEconomy": "🚩 政治/经济/资源",
+    "Technology": "⚙️ 科技/魔法水平",
+    "MajorRaces": "🧬 主要种族/族群",
+    "CultureLife": "🎭 文化/风俗/日常",
+    "BeliefValue": "🧘 信仰/价值观/哲学",
+    "Mysteries": "❓ 神秘禁忌/未解之谜",
+    "Organization": "🛡️ 势力/宗门/组织",
+    "Creature": "🐉 灵兽/怪物/异种",
+    "Item": "⚔️ 物品/法宝/神器",
+    "MagicSkill": "⚡ 功法/神通/技能",
+    "Other": "📝 其他补充"
+}
+
 def inject_custom_css():
-    st.markdown("""
+    st.markdown(f"""
     <style>
-        /* 1. 隐藏上传组件内部的默认英文文本 */
-        [data-testid="stFileUploaderDropzone"] > div > div > span { display: none; }
-        [data-testid="stFileUploaderDropzone"] > div > div > small { display: none; }
-        [data-testid="stFileUploaderDropzone"] button { display: none; }
-
-        /* 2. 中文提示 */
-        [data-testid="stFileUploaderDropzone"]::before {
-            content: "☁️ 将经典章节文件 (TXT/PDF) 拖放到此处";
+        [data-testid="stFileUploaderDropzone"] > div > div > span {{ display: none; }}
+        [data-testid="stFileUploaderDropzone"] > div > div > small {{ display: none; }}
+        [data-testid="stFileUploaderDropzone"] button {{ display: none; }}
+        [data-testid="stFileUploaderDropzone"]::before {{
+            content: "☁️ 拖放 TXT/PDF 文件至此";
             position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
             font-size: 16px; font-weight: bold; color: #555; pointer-events: none;
-        }
-        [data-testid="stFileUploaderDropzone"]::after {
-            content: "限 200MB • 支持拖拽上传";
-            position: absolute; top: 60%; left: 50%; transform: translate(-50%, -50%);
-            font-size: 12px; color: #888; pointer-events: none;
-        }
-        [data-testid="stFileUploaderDropzone"] {
-            min-height: 120px; text-align: center; position: relative;
-            background-color: #f8f9fa; border: 1px dashed #ccc;
-        }
+        }}
+        [data-testid="stFileUploaderDropzone"] {{
+            min-height: 100px; background-color: #f8f9fa; border: 1px dashed #ccc;
+        }}
+        .setting-tag {{
+            display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px;
+            background-color: {THEME_LIGHT}; color: {THEME_COLOR}; border: 1px solid {THEME_COLOR}; margin-right: 5px;
+        }}
+        .mention-highlight {{
+            background-color: #fff3cd; padding: 0 2px; border-radius: 3px; font-weight: bold;
+        }}
+        /* 角色横幅 */
+        .char-strip {{
+            display: flex; gap: 15px; overflow-x: auto; padding: 10px 5px;
+            margin-bottom: 15px; scrollbar-width: thin; border-bottom: 1px dashed #eee;
+        }}
+        .char-item {{
+            display: flex; flex-direction: column; align-items: center;
+            min-width: 60px; max-width: 70px; cursor: pointer;
+        }}
+        .char-img {{
+            width: 50px; height: 50px; border-radius: 50%; object-fit: cover;
+            border: 2px solid {THEME_LIGHT}; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: transform 0.2s;
+        }}
+        .char-img:hover {{ transform: scale(1.1); border-color: {THEME_COLOR}; }}
+        .char-name {{ font-size: 11px; font-weight: bold; margin-top: 5px; color: #333; }}
+        .char-role {{ font-size: 9px; color: #666; }}
     </style>
     """, unsafe_allow_html=True)
 
-# --- 辅助函数：更新书籍时间戳 ---
+# --- 辅助函数 ---
+def get_image_src(path_or_url):
+    if not path_or_url: return None
+    try:
+        path_or_url = str(path_or_url).strip()
+        if path_or_url.startswith("http") or path_or_url.startswith("data:"): 
+            return path_or_url
+        if os.path.exists(path_or_url):
+            with open(path_or_url, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode('utf-8')
+                ext = os.path.splitext(path_or_url)[1].lower().replace('.', '')
+                mime_map = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg'}
+                mime = mime_map.get(ext, 'image/png')
+                return f"data:{mime};base64,{b64}"
+    except Exception as e: 
+        print(f"Image load error: {e}")
+        return None
+    return None
+
 def update_book_timestamp_by_book_id(book_id):
     if book_id:
-        st.session_state.db.update_book_timestamp(book_id)
+        try: st.session_state.db.update_book_timestamp(book_id)
+        except: pass
+
+def ensure_schema_compatibility(db_mgr):
+    try:
+        db_mgr.query("SELECT id FROM plots LIMIT 1")
+    except:
+        try:
+            db_mgr.execute("""
+                CREATE TABLE IF NOT EXISTS plots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id INTEGER,
+                    content TEXT,
+                    status TEXT,
+                    importance INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except: pass
+
+def find_mentions_in_book(db_mgr, book_id, keyword):
+    if not keyword or len(keyword.strip()) < 2: return []
+    keyword = keyword.strip()
+    results = []
+    
+    parts = db_mgr.query("SELECT id, name FROM parts WHERE book_id=?", (book_id,))
+    for p in parts:
+        vols = db_mgr.query("SELECT id, name FROM volumes WHERE part_id=?", (p['id'],))
+        for v in vols:
+            chaps = db_mgr.query("SELECT id, title, content FROM chapters WHERE volume_id=?", (v['id'],))
+            for c in chaps:
+                content = c['content'] or ""
+                if keyword in content:
+                    idx = content.find(keyword)
+                    start = max(0, idx - 20)
+                    end = min(len(content), idx + len(keyword) + 30)
+                    snippet = content[start:end].replace(keyword, f"<span class='mention-highlight'>{keyword}</span>")
+                    results.append({
+                        "chap_title": f"{v['name']} - {c['title']}",
+                        "snippet": snippet,
+                        "count": content.count(keyword)
+                    })
+    return results
 
 # ==============================================================================
 # 核心渲染逻辑
 # ==============================================================================
 
-def render_knowledge(engine, current_book, current_chapter):
-    """渲染拆书知识库页面"""
+def render_knowledge(engine, current_book_arg, current_chapter):
+    """渲染 知识库 & 设定集 页面"""
     inject_custom_css()
     db_mgr = st.session_state.db
+    ensure_schema_compatibility(db_mgr)
     
-    render_header("🧠", "拆书知识库")
-    
-    tab_extract, tab_transform = st.tabs(["🧬 风格提炼 (知识库构建)", "🖋️ 风格改造"])
+    render_header("🧠", "世界设定 & 知识库")
     
     # --------------------------------------------------------------------------
-    # Tab 1: 风格提炼
+    # 0. 独立书籍选择器 
+    # --------------------------------------------------------------------------
+    all_books = db_mgr.query("SELECT id, title FROM books ORDER BY updated_at DESC")
+    
+    if not all_books:
+        st.warning("📚 暂无书籍。请先前往【书籍管理】创建一本新书。")
+        return
+
+    book_map = {b['title']: b['id'] for b in all_books}
+    book_titles = list(book_map.keys())
+
+    # 默认选中逻辑
+    if "knowledge_local_sel" not in st.session_state:
+        initial_title = book_titles[0]
+        if current_book_arg and current_book_arg['title'] in book_titles:
+            initial_title = current_book_arg['title']
+        st.session_state["knowledge_local_sel"] = initial_title
+
+    if st.session_state["knowledge_local_sel"] not in book_titles:
+        st.session_state["knowledge_local_sel"] = book_titles[0]
+
+    # 🔥 UI对齐优化：使用 vertical_alignment="center"
+    c_sel, c_info = st.columns([2, 3], vertical_alignment="center")
+    with c_sel:
+        selected_title = st.selectbox(
+            "📘 当前阅览书籍", 
+            book_titles, 
+            key="knowledge_local_sel" 
+        )
+        current_book_id = book_map[selected_title]
+    
+    with c_info:
+        # 使用 Markdown 来微调样式，使其在视觉上更平衡
+        st.info("💡 提示：AI 在写作时会自动查阅这些信息。")
+
+    # --------------------------------------------------------------------------
+    # Tab 页面渲染
+    # --------------------------------------------------------------------------
+    tab_lore, tab_extract, tab_transform = st.tabs(["🌍 世界设定集", "🧬 风格提炼", "🖋️ 风格改造"])
+    
+    # --------------------------------------------------------------------------
+    # Tab 1: 世界设定集 (保持功能)
+    # --------------------------------------------------------------------------
+    with tab_lore:
+        # === 顶部：角色快速概览 ===
+        try:
+            chars_query = db_mgr.query("SELECT * FROM characters WHERE book_id=? ORDER BY is_major DESC, id ASC", (current_book_id,))
+            chars = [dict(c) for c in chars_query]
+            
+            if chars:
+                html_parts = ['<div class="char-strip">']
+                for c in chars:
+                    try:
+                        safe_name = html.escape(str(c.get('name') or "未知"))
+                        safe_role = html.escape(str(c.get('role') or "配角"))
+                        safe_desc = html.escape(str(c.get('desc') or ""))
+                        img_src = get_image_src(c.get('avatar'))
+                        
+                        if not img_src:
+                            letter = safe_name[0] if safe_name else "?"
+                            img_elem = f"""<div style="width:50px;height:50px;border-radius:50%;background:{THEME_LIGHT};color:{THEME_COLOR};display:flex;align-items:center;justify-content:center;font-weight:bold;border:2px solid {THEME_LIGHT};">{letter}</div>"""
+                        else:
+                            img_elem = f"""<img src="{img_src}" class="char-img">"""
+                        
+                        html_parts.append(f"""<div class="char-item" title="{safe_name} ({safe_role}): {safe_desc}">{img_elem}<div class="char-name">{safe_name}</div><div class="char-role">{safe_role}</div></div>""")
+                    except Exception as render_err:
+                        continue
+                html_parts.append('</div>')
+                st.markdown("".join(html_parts), unsafe_allow_html=True)
+            else:
+                st.info("💡 该书籍暂无角色数据，请前往【角色档案】页面添加。")
+        except Exception as char_query_err:
+            chars = []
+        
+        # === 主体：设定管理 ===
+        col_list, col_detail = st.columns([1.2, 2])
+        
+        with col_list:
+            c_tools_1, c_tools_2 = st.columns(2)
+            with c_tools_1: st.markdown("##### 📜 设定目录")
+            with c_tools_2:
+                with st.popover("📥 导入/共享", use_container_width=True):
+                    st.markdown("**从其他书籍导入**")
+                    other_books = [b for b in all_books if b['id'] != current_book_id]
+                    if other_books:
+                        imp_book_title = st.selectbox("选择来源", [b['title'] for b in other_books])
+                        if st.button("开始导入"):
+                            src_id = book_map[imp_book_title]
+                            src_rows = db_mgr.query("SELECT content, status, importance FROM plots WHERE book_id=? AND status LIKE 'Setting_%'", (src_id,))
+                            count = 0
+                            for row_raw in src_rows:
+                                row = dict(row_raw)
+                                db_mgr.execute("INSERT INTO plots (book_id, content, status, importance) VALUES (?,?,?,?)", 
+                                               (current_book_id, row['content'], row['status'], row['importance']))
+                                count += 1
+                            st.toast(f"✅ 成功导入 {count} 条设定")
+                            time.sleep(1); st.rerun()
+                    else: st.caption("无其他书籍")
+
+            book_info = db_mgr.query("SELECT intro FROM books WHERE id=?", (current_book_id,))
+            book_intro = book_info[0]['intro'] if book_info else ""
+            
+            selection_map = {}
+            st.caption("🤖 系统档案")
+            if book_intro:
+                key = "📚 书籍简介 & 标签"
+                selection_map[key] = {"type": "sys_book", "content": book_intro}
+                if st.button(key, use_container_width=True, type="secondary"): st.session_state['know_sel_key'] = key
+
+            char_key = f"👥 角色档案管理 ({len(chars)})"
+            selection_map[char_key] = {"type": "sys_chars", "data": chars}
+            if st.button(char_key, use_container_width=True, type="secondary"): st.session_state['know_sel_key'] = char_key
+            
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+            
+            st.caption("✍️ 手动设定集")
+            if st.button("➕ 新建设定条目", use_container_width=True, type="primary"):
+                st.session_state['know_sel_key'] = "新建条目"
+            
+            manual_settings = db_mgr.query("SELECT id, content, status FROM plots WHERE book_id=? AND status LIKE 'Setting_%' ORDER BY id DESC", (current_book_id,))
+            
+            if not manual_settings:
+                st.markdown("<div style='color:#888; font-size:12px; margin-top:10px;'>暂无自定义设定<br>点击上方按钮添加</div>", unsafe_allow_html=True)
+            
+            type_keys_base = list(SETTING_TYPES.keys())
+            grouped_settings = {k: [] for k in type_keys_base}
+            
+            for row in manual_settings:
+                status = row['status']
+                sType = status.split("Setting_")[1] if status.startswith("Setting_") else "Other"
+                if sType not in SETTING_TYPES: sType = "Other" 
+                
+                f_content = row['content'] or ""
+                raw_title = f_content.split('\n')[0].strip()
+                # 列表显示时也清理一下标题
+                clean_title = re.sub(r'^【.*?】', '', raw_title).strip()
+                if not clean_title: clean_title = "未命名条目"
+                if len(clean_title) > 20: clean_title = clean_title[:20] + "..."
+                
+                grouped_settings[sType].append({"id": row['id'], "title": clean_title, "content": f_content, "full_type": sType})
+
+            for type_key, type_label in SETTING_TYPES.items():
+                items = grouped_settings.get(type_key, [])
+                if items:
+                    expanded_default = type_key in ["Universe", "PowerSystem", "Geography"]
+                    with st.expander(f"{type_label} ({len(items)})", expanded=expanded_default): 
+                        for item in items:
+                            btn_label = f"{item['title']}"
+                            u_key = f"setting_{item['id']}"
+                            selection_map[u_key] = {"type": "manual", "data": item}
+                            if st.button(btn_label, key=f"btn_{u_key}", use_container_width=True):
+                                st.session_state['know_sel_key'] = u_key
+
+        with col_detail:
+            sel_key = st.session_state.get('know_sel_key', "新建条目")
+            if sel_key == "NEW_ENTRY": sel_key = "新建条目"
+            
+            if sel_key == "新建条目":
+                st.subheader("➕ 新建设定")
+                with st.form("new_setting"):
+                    c_type, c_title = st.columns([1, 2])
+                    type_opts = list(SETTING_TYPES.keys())
+                    sel_type = c_type.selectbox("分类", type_opts, format_func=lambda x: SETTING_TYPES[x])
+                    n_title = c_title.text_input("名称 (必填)", placeholder="例如：青云门、境界划分")
+                    n_content = st.text_area("详细内容", height=300, placeholder="在此输入详细描述、规则、历史背景等...")
+                    if st.form_submit_button("保存", type="primary", use_container_width=True):
+                        if n_title and n_content:
+                            db_mgr.execute("INSERT INTO plots (book_id, content, status, importance) VALUES (?, ?, ?, 0)", 
+                                           (current_book_id, f"{n_title}\n{n_content}", f"Setting_{sel_type}"))
+                            update_book_timestamp_by_book_id(current_book_id)
+                            st.toast("✅ 保存成功"); time.sleep(0.5); st.rerun()
+                        else: st.error("请填写完整")
+
+            elif sel_key in selection_map:
+                data = selection_map[sel_key]
+                
+                # 系统档案/角色编辑
+                if data['type'].startswith('sys'):
+                    if data['type'] == "sys_book":
+                        st.subheader("📚 书籍简介")
+                        st.text_area("预览", value=data['content'], height=400, disabled=True)
+                        
+                    elif data['type'] == "sys_chars":
+                        st.subheader("👥 角色档案编辑器")
+                        
+                        char_list = data.get('data', [])
+                        if not char_list:
+                            st.info("暂无角色，请在 AI 导入或架构生成中创建。")
+                        else:
+                            char_names = [f"{c['name']} ({c['role']})" for c in char_list]
+                            sel_idx = 0
+                            if 'last_edit_char_idx' in st.session_state and st.session_state.last_edit_char_idx < len(char_names):
+                                sel_idx = st.session_state.last_edit_char_idx
+                                
+                            sel_char_str = st.selectbox("选择要编辑的角色", char_names, index=sel_idx, key="char_edit_sel")
+                            
+                            sel_char_idx = char_names.index(sel_char_str)
+                            st.session_state.last_edit_char_idx = sel_char_idx
+                            target_char = char_list[sel_char_idx]
+                            
+                            st.markdown(f"**正在编辑：{target_char['name']}**")
+                            
+                            with st.form(key=f"form_char_{target_char['id']}"):
+                                with st.expander("📝 基础信息", expanded=True):
+                                    c1, c2, c3 = st.columns(3)
+                                    e_name = c1.text_input("姓名", value=target_char.get('name',''))
+                                    e_role = c2.text_input("定位 (主角/反派/配角)", value=target_char.get('role',''))
+                                    e_gender = c3.text_input("性别", value=target_char.get('gender',''))
+                                    e_race = st.text_input("种族", value=target_char.get('race',''))
+
+                                with st.expander("🏙️ 背景与身份", expanded=True):
+                                    c1, c2 = st.columns(2)
+                                    e_origin = c1.text_input("出身背景", value=target_char.get('origin','') or "")
+                                    e_profession = c2.text_input("职业/天赋", value=target_char.get('profession','') or "")
+                                    e_social = st.text_input("社会角色/地位", value=target_char.get('social_role','') or "")
+                                    
+                                with st.expander("⚔️ 能力与外挂", expanded=True):
+                                    e_cheat = st.text_input("金手指/核心能力", value=target_char.get('cheat_ability','') or "")
+                                    c1, c2 = st.columns(2)
+                                    e_power = c1.text_input("当前境界/等级", value=target_char.get('power_level','') or "")
+                                    e_limit = c2.text_input("能力代价/副作用", value=target_char.get('ability_limitations','') or "")
+                                    
+                                with st.expander("👀 形象与关系", expanded=True):
+                                    e_look = st.text_area("外貌特征 (记忆点)", value=target_char.get('appearance_features','') or "", height=70)
+                                    e_sign = st.text_input("标志性动作/口头禅", value=target_char.get('signature_sign','') or "")
+                                    e_rel_mc = st.text_input("与主角关系", value=target_char.get('relationship_to_protagonist','') or "")
+                                    e_feuds = st.text_area("恩仇与债务 (剧情钩子)", value=target_char.get('debts_and_feuds','') or "", height=70)
+
+                                st.markdown("---")
+                                e_desc = st.text_area("📜 综合简介 (AI 主要参考此字段)", value=target_char.get('desc',''), height=150, help="如果上方字段为空，AI 会尝试从这里提取信息。")
+
+                                if st.form_submit_button("💾 保存角色修改", type="primary", use_container_width=True):
+                                    db_mgr.execute("""
+                                        UPDATE characters SET 
+                                        name=?, role=?, gender=?, race=?, "desc"=?,
+                                        origin=?, profession=?, social_role=?,
+                                        cheat_ability=?, power_level=?, ability_limitations=?,
+                                        appearance_features=?, signature_sign=?,
+                                        relationship_to_protagonist=?, debts_and_feuds=?
+                                        WHERE id=?
+                                    """, (
+                                        e_name, e_role, e_gender, e_race, e_desc,
+                                        e_origin, e_profession, e_social,
+                                        e_cheat, e_power, e_limit,
+                                        e_look, e_sign,
+                                        e_rel_mc, e_feuds,
+                                        target_char['id']
+                                    ))
+                                    update_book_timestamp_by_book_id(current_book_id)
+                                    st.toast(f"✅ 角色 {e_name} 更新成功！")
+                                    time.sleep(0.5)
+                                    st.rerun()
+
+                # 手动设定编辑
+                elif data['type'] == 'manual':
+                    item = data['data']
+                    f_text = item['content']
+                    curr_title, curr_body = (f_text.split("\n", 1) + [""])[:2]
+                    
+                    # 🔥 [Logic 更新] 清洗旧数据中的英文标签 (如 【Geography】)，只显示纯标题
+                    curr_title = re.sub(r'^【.*?】', '', curr_title).strip()
+                    
+                    st.subheader(f"📝 编辑：{curr_title}")
+                    with st.expander("🔍 查找文中引用"):
+                        if st.button("开始搜索", key=f"tk_{item['id']}"):
+                            ms = find_mentions_in_book(db_mgr, current_book_id, curr_title)
+                            if ms:
+                                for m in ms: st.markdown(f"**{m['chap_title']}** ({m['count']}次)<br>...{m['snippet']}...", unsafe_allow_html=True)
+                            else: st.warning("未找到引用")
+
+                    with st.form(key=f"ed_{item['id']}"):
+                        c_t, c_n = st.columns([1, 2])
+                        curr_type = item['full_type']
+                        try: idx = list(SETTING_TYPES.keys()).index(curr_type)
+                        except ValueError: idx = 0 
+                        
+                        n_type = c_t.selectbox("分类", list(SETTING_TYPES.keys()), index=idx, format_func=lambda x: SETTING_TYPES[x])
+                        n_title_val = c_n.text_input("名称", value=curr_title)
+                        n_body_val = st.text_area("内容", value=curr_body, height=350)
+                        
+                        c_del, c_upd = st.columns([1, 1])
+                        if c_del.form_submit_button("🗑️ 删除", type="secondary"):
+                            db_mgr.execute("DELETE FROM plots WHERE id=?", (item['id'],))
+                            st.session_state['know_sel_key'] = "新建条目"; st.rerun()
+                        if c_upd.form_submit_button("💾 保存", type="primary"):
+                            # 🔥 保存时也不带英文标签，保持数据纯净
+                            db_mgr.execute("UPDATE plots SET content=?, status=? WHERE id=?", 
+                                           (f"{n_title_val}\n{n_body_val}", f"Setting_{n_type}", item['id']))
+                            update_book_timestamp_by_book_id(current_book_id)
+                            st.toast("✅ 更新成功"); time.sleep(0.5); st.rerun()
+
+    # --------------------------------------------------------------------------
+    # Tab 2: 风格提炼 (🔥 增加直接粘贴 & 进度条)
     # --------------------------------------------------------------------------
     with tab_extract:
-        st.markdown("#### 📖 上传经典小说章节，培养AI作家")
+        st.markdown("#### 📖 风格学习")
+        st.info(f"ℹ️ 这里提炼的风格仅属于当前书籍《{selected_title}》。")
         
-        up_file_extract = st.file_uploader(
-            "file_uploader_hidden_label", 
-            type=["txt", "docx", "pdf"], 
-            key="up_extract",
-            label_visibility="collapsed"
-        )
+        # 分栏：文件上传 vs 直接粘贴
+        t_mode = st.radio("输入方式", ["📂 上传文件 (TXT/PDF)", "📝 直接粘贴文本"], horizontal=True, label_visibility="collapsed")
         
-        col_btn_start, _ = st.columns([1, 4])
+        source_text = None
+        source_name = None
         
-        if col_btn_start.button("🚀 开始风格拆解", type="primary"):
-            if up_file_extract:
-                client, model, model_key = engine.get_client("knowledge_analyze")
-                if not client:
-                    st.error("请先在【系统设置】配置分配给 [拆书知识 - 风格/设定分析] 的模型 Key")
+        if t_mode == "📂 上传文件 (TXT/PDF)":
+            up_file = st.file_uploader("上传参考文本", type=["txt", "docx", "pdf"], key="up_ex", label_visibility="collapsed")
+            if up_file:
+                try:
+                    up_file.seek(0)
+                    source_text = up_file.read().decode('utf-8', errors='ignore')[:15000]
+                    source_name = up_file.name
+                except Exception as e:
+                    st.error(f"文件读取失败: {e}")
+        else:
+            paste_text = st.text_area("在此粘贴大神作品片段...", height=200, placeholder="粘贴 500-2000 字的精彩片段，让 AI 学习其文笔特征。")
+            if paste_text.strip():
+                source_text = paste_text[:15000]
+                source_name = f"粘贴片段_{int(time.time())}"
+        
+        if st.button("🚀 开始提炼风格 DNA", type="primary", use_container_width=True):
+            if source_text:
+                client, model, _ = engine.get_client("knowledge_analyze")
+                if client:
                     ensure_log_file()
-                    log_operation("AI生成失败", "风格拆解失败: 模型 Key 未配置")
-                else:
-                    ensure_log_file()
-                    log_operation("AI生成", f"开始分析文件: {up_file_extract.name}")
+                    log_operation("AI生成", f"开始分析风格: {source_name}")
                     
-                    with st.spinner("AI 正在深度解析文本，提炼写作风格..."):
-                        try:
-                            if up_file_extract.type == "text/plain":
-                                text = up_file_extract.read().decode('utf-8', errors='ignore')[:10000] 
-                            else:
-                                st.warning(f"目前 AI 深度解析建议使用 TXT 格式。")
-                                text = up_file_extract.read().decode('utf-8', errors='ignore')[:5000]
-
-                            analysis_result = engine.generate_style_analysis(text, client, model)
-                            style_name = analysis_result.get('style_name', f'未命名风格_{int(time.time())}')
-                            
-                            book_id_to_save = current_book['id'] if current_book else 0
-                            db_mgr.execute(
-                                "INSERT INTO plots (book_id, content, status, importance) VALUES (?, ?, ?, ?)",
-                                (book_id_to_save, style_name, "StyleDNA", 5)
-                            )
-                            update_book_timestamp_by_book_id(book_id_to_save)
-                            
-                            st.success("风格提炼完成，已保存到知识库！")
-                            ensure_log_file()
-                            log_operation("AI生成", f"风格提炼成功并保存: {style_name}") 
-                            
-                            with st.expander("查看分析详情 JSON", expanded=False):
-                                st.json(analysis_result)
-                            time.sleep(1)
-                            st.rerun() 
-                        except Exception as e:
-                            st.error(f"AI 分析失败: {e}")
-                            ensure_log_file()
-                            log_operation("AI生成失败", f"风格提炼异常: {e}") 
-            else:
-                st.error("请先上传文件。")
+                    # 🔥 进度条逻辑
+                    progress_bar = st.progress(0, text="🚀 正在启动 AI 引擎...")
+                    
+                    try:
+                        time.sleep(0.2)
+                        progress_bar.progress(20, text="📖 正在深度阅读文本...")
+                        
+                        # 模拟分析进度 (因为 API 是阻塞的，只能模拟)
+                        time.sleep(0.5)
+                        progress_bar.progress(50, text="🧠 正在提取修辞、句式与情感特征...")
+                        
+                        res = engine.generate_style_analysis(source_text, client, model) 
+                        
+                        progress_bar.progress(85, text="💾 正在生成风格档案...")
+                        
+                        sn = res.get('style_name', f'风格_{int(time.time())}')
+                        db_mgr.execute("INSERT INTO plots (book_id, content, status, importance) VALUES (?, ?, 'StyleDNA', 5)", (current_book_id, sn))
+                        update_book_timestamp_by_book_id(current_book_id)
+                        
+                        progress_bar.progress(100, text="✅ 提炼完成！")
+                        st.success(f"风格档案已保存：{sn}")
+                        time.sleep(1); st.rerun()
+                    except Exception as e: 
+                        progress_bar.empty()
+                        st.error(f"分析失败: {e}")
+                else: st.error("未配置 AI 模型")
+            else: st.error("请提供有效文本")
         
-        # 修改：已移除横线 st.divider()
-        
-        with st.expander("📚 已提炼风格列表 (知识库历史)", expanded=True):
-            all_styles = db_mgr.query("SELECT id, content, created_at FROM plots WHERE status='StyleDNA' ORDER BY id DESC")
-            if all_styles:
-                for s in all_styles:
-                    col_s1, col_s2 = st.columns([4, 1])
-                    with col_s1:
-                        st.markdown(f"**🧬 {s['content']}**")
-                        try:
-                            dt_obj = datetime.strptime(str(s['created_at']).split('.')[0], '%Y-%m-%d %H:%M:%S')
-                            date_str = dt_obj.strftime('%Y-%m-%d %H:%M')
-                        except: date_str = "时间未知"
-                        st.caption(f"创建时间: {date_str}")
-                    with col_s2:
-                        if st.button("❌", key=f"del_style_{s['id']}", help="删除该风格"):
-                            db_mgr.execute("DELETE FROM plots WHERE id=?", (s['id'],))
-                            if current_book: update_book_timestamp_by_book_id(current_book['id'])
-                            ensure_log_file()
-                            log_operation("删除数据", f"删除风格知识库: {s['content']}") 
-                            st.rerun()
-            else:
-                st.info("暂无提炼的风格历史记录。")
+        st.divider()
+        st.markdown("##### 🧬 当前书籍的风格库")
+        styles = db_mgr.query("SELECT id, content FROM plots WHERE status='StyleDNA' AND book_id=? ORDER BY id DESC", (current_book_id,))
+        if styles:
+            for s in styles:
+                c1, c2 = st.columns([4, 1])
+                c1.markdown(f"**🎨 {s['content']}**")
+                if c2.button("🗑️", key=f"ds_{s['id']}"):
+                    db_mgr.execute("DELETE FROM plots WHERE id=?", (s['id'],)); st.rerun()
+        else: st.info("📭 暂无数据。请上传大神作品（如金庸小说片段）来提取风格。")
 
     # --------------------------------------------------------------------------
-    # Tab 2: 风格改造
+    # Tab 3: 风格改造 (🔥 修复功能缺失)
     # --------------------------------------------------------------------------
     with tab_transform:
-        st.markdown("#### 💡 改造你的章节")
+        st.markdown("#### 💡 风格重写 (全局可用)")
         
-        # --- 1. 获取所有书籍 ---
-        all_books = db_mgr.query("SELECT id, title FROM books ORDER BY updated_at DESC")
-        if not all_books:
-            st.warning("暂无书籍，请先去【书籍管理】创建或导入书籍。")
-            st.stop()
-            
-        book_map = {b['title']: b['id'] for b in all_books}
+        c_ch, c_st = st.columns([1.5, 1])
         
-        # 确定当前选中的书
-        default_book_idx = 0
-        if current_book and current_book['title'] in book_map:
-            default_book_idx = list(book_map.keys()).index(current_book['title'])
-            
-        col_sel_book, col_sel_chap = st.columns([1, 1.5])
-        
-        with col_sel_book:
-            selected_book_title = st.selectbox("1. 选择书籍", list(book_map.keys()), index=default_book_idx, key="know_sel_book")
-            selected_book_id = book_map[selected_book_title]
-
-        # --- 2. 获取选中书籍的所有章节 ---
-        parts = db_mgr.query("SELECT id FROM parts WHERE book_id=?", (selected_book_id,))
-        chapter_options = {} 
+        # 1. 选择章节 (可选)
+        parts = db_mgr.query("SELECT id FROM parts WHERE book_id=?", (current_book_id,))
+        chap_opts = {"(不使用章节，直接粘贴)": {"id": None, "content": ""}}
         
         for p in parts:
             vols = db_mgr.query("SELECT id, name FROM volumes WHERE part_id=?", (p['id'],))
             for v in vols:
-                chaps = db_mgr.query("SELECT id, title, content FROM chapters WHERE volume_id=? ORDER BY sort_order", (v['id'],))
-                for c in chaps:
-                    label = f"【{v['name']}】{c['title']}"
-                    chapter_options[label] = {"id": c['id'], "content": c['content']}
+                chaps = db_mgr.query("SELECT id, title, content FROM chapters WHERE volume_id=?", (v['id'],))
+                for c in chaps: 
+                    label = f"{c['title']}"
+                    chap_opts[label] = {"id": c['id'], "content": c['content']}
         
-        with col_sel_chap:
-            if not chapter_options:
-                st.selectbox("2. 选择目标章节", ["(该书暂无章节)"], disabled=True)
-                target_chap_content = ""
-                target_chap_id = None
-            else:
-                default_chap_label = list(chapter_options.keys())[0]
-                if current_chapter and current_book and current_book['id'] == selected_book_id:
-                     for lbl, data in chapter_options.items():
-                         if data['id'] == current_chapter['id']:
-                             default_chap_label = lbl
-                             break
-                
-                selected_chap_label = st.selectbox("2. 选择目标章节", list(chapter_options.keys()), index=list(chapter_options.keys()).index(default_chap_label))
-                target_chap_id = chapter_options[selected_chap_label]['id']
-                target_chap_content = chapter_options[selected_chap_label]['content']
-
-        # --- 3. 风格选择 ---
-        available_styles = db_mgr.query("SELECT DISTINCT content FROM plots WHERE status='StyleDNA' AND content IS NOT NULL AND content != ''")
-        style_options = sorted(list(set([s['content'] for s in available_styles])))
-        style_options.insert(0, "（AI自由发挥 - 大神优化）")
-        
-        st.markdown("<div style='height: 10px'></div>", unsafe_allow_html=True)
-        selected_style = st.selectbox("3. 选择参考的经典风格", style_options)
-        
-        # --- 4. 内容编辑区 ---
-        input_key = f"trans_input_{target_chap_id}" if target_chap_id else "trans_input_empty"
-        chapter_to_transform = st.text_area("待改造内容 (自动加载选中章节，可手动微调)", value=target_chap_content, height=300, key=input_key)
-
-        col_btn_run, _ = st.columns([1, 2])
-        
-        if col_btn_run.button("🤖 AI 自动生成改造版本", type="primary"):
-            if not chapter_to_transform.strip():
-                st.error("内容为空，无法改造")
-                st.stop()
+        chap_keys = list(chap_opts.keys())
+        # 尝试选中当前阅读的章节
+        default_idx = 0
+        if current_chapter and current_chapter.get('title') in chap_keys:
+            default_idx = chap_keys.index(current_chapter['title'])
             
-            client, model, model_key = engine.get_client("knowledge_style_gen")
-            if not client: 
-                st.error("API Key 未配置")
-                st.stop()
-                
-            if selected_style == "（AI自由发挥 - 大神优化）":
-                style_prompt = "请你以资深网文主编的身份，优化以下章节的文笔、节奏和画面感，使其更具吸引力。"
-            else:
-                style_prompt = f"请严格参照并模仿【{selected_style}】的写作风格（包括其用词习惯、句式节奏、描写侧重），重新改写以下章节。"
+        sel_ch = c_ch.selectbox("1. 导入来源 (可选)", chap_keys, index=default_idx)
+        
+        t_id = chap_opts[sel_ch]['id']
+        t_content_db = chap_opts[sel_ch]['content']
+        
+        # 2. 选择风格
+        avail_styles = db_mgr.query("SELECT DISTINCT content FROM plots WHERE status='StyleDNA'")
+        s_list = sorted(list(set([s['content'] for s in avail_styles]))) + ["通用大神优化"]
+        sel_style = c_st.selectbox("2. 选择目标风格", s_list)
+        
+        # 3. 输入框 (🔥 永远显示，如果有章节内容则预填充)
+        st.caption("待重写内容 (可手动修改):")
+        input_content = st.text_area("input_rewrite", value=t_content_db, height=200, label_visibility="collapsed", placeholder="在此输入或粘贴需要重写的段落...")
+        
+        # 4. 按钮 (🔥 永远显示)
+        # 5. 输出结果 (🔥 新增文本框显示)
+        
+        c_act, c_res = st.columns([1, 2])
+        
+        with c_act:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🪄 开始重写 ➤", type="primary", use_container_width=True):
+                if not input_content.strip():
+                    st.warning("⚠️ 请先输入内容")
+                else:
+                    client, model, _ = engine.get_client("knowledge_style_gen")
+                    if client:
+                        ensure_log_file()
+                        log_operation("AI辅助", f"风格重写: {sel_style}")
+                        
+                        progress_text = "✨ AI 正在挥毫泼墨..."
+                        my_bar = st.progress(0, text=progress_text)
+                        
+                        try:
+                            # 模拟进度
+                            for i in range(30):
+                                time.sleep(0.02); my_bar.progress(i + 1, text=progress_text)
 
-            user_msg = f"{style_prompt}\n\n【原始文本】：\n{chapter_to_transform}\n\n【改写要求】：\n1. 保持原剧情走向不变\n2. 显著提升文笔和风格契合度\n3. 输出完整的改写后正文，不要包含解释性语言。"
-            
-            ensure_log_file()
-            log_operation("AI辅助", f"开始风格改造: {selected_style} (BookID:{selected_book_id})")
+                            p = f"请模仿【{sel_style}】的文笔风格对以下文本进行润色重写。保留原意，但提升文学性。" if "通用" not in sel_style else "请优化文笔节奏，使其更具文学性。"
+                            
+                            stream = client.chat.completions.create(
+                                model=model, messages=[{"role": "user", "content": f"{p}\n\n【原文】：\n{input_content}"}], stream=True
+                            )
+                            
+                            full_res = ""
+                            res_box = st.empty() # 占位
+                            
+                            for chunk in stream:
+                                if chunk.choices[0].delta.content:
+                                    full_res += chunk.choices[0].delta.content
+                                    # 实时更新 session 以便渲染
+                                    st.session_state['last_trans'] = full_res
+                            
+                            my_bar.progress(100, text="✅ 重写完成！")
+                            time.sleep(0.5); my_bar.empty()
+                            st.rerun() # 刷新以显示结果在下方文本框
+                            
+                        except Exception as e:
+                            st.error(f"AI 调用错误: {e}")
+                    else: st.error("未配置 AI 模型")
 
-            with st.spinner("AI 正在挥毫泼墨进行改写..."):
-                try:
-                    stream = client.chat.completions.create(
-                        model=model,
-                        messages=[{"role": "user", "content": user_msg}],
-                        stream=True,
-                        max_tokens=4000
-                    )
-                    
-                    st.markdown("##### 🖋️ 改造结果预览：")
-                    result_area = st.empty()
-                    full_content = ""
-                    
-                    for chunk in stream:
-                        if chunk.choices and chunk.choices[0].delta.content:
-                            full_content += chunk.choices[0].delta.content
-                            result_area.markdown(full_content + "▌")
-                    
-                    result_area.markdown(full_content)
-                    st.session_state['last_transform_result'] = full_content
-                    
-                    ensure_log_file()
-                    log_operation("AI辅助", f"风格改造完成 (约{len(full_content)}字)")
-                    
-                except Exception as e:
-                    st.error(f"生成出错: {e}")
-                    ensure_log_file()
-                    log_operation("AI生成失败", f"改造过程出错: {e}")
-
-        # --- 5. 保存区 ---
-        if 'last_transform_result' in st.session_state and st.session_state['last_transform_result']:
-            st.success("生成完成！")
-            
-            if target_chap_id:
-                if st.button(f"💾 覆盖保存到：{selected_chap_label}", type="primary", use_container_width=True):
-                    new_content = st.session_state['last_transform_result']
-                    db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (new_content, target_chap_id))
-                    update_book_timestamp_by_book_id(selected_book_id)
-                    
-                    ensure_log_file()
-                    log_operation("更新章节", f"应用风格改造结果覆盖章节 ID:{target_chap_id} ({selected_chap_label})")
-                    
-                    st.toast("✅ 已覆盖保存")
+            # 保存按钮
+            if t_id and 'last_trans' in st.session_state:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("💾 覆盖原章节", type="secondary", use_container_width=True, help="将右侧结果保存回当前章节"):
+                    db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (st.session_state['last_trans'], t_id))
+                    st.toast("✅ 已保存至章节！")
                     time.sleep(1)
-                    del st.session_state['last_transform_result']
-                    st.rerun()
-            else:
-                st.warning("未检测到有效章节 ID，请手动复制上方内容。")
+
+        with c_res:
+            st.caption("重写结果 (可直接复制):")
+            res_val = st.session_state.get('last_trans', "")
+            st.text_area("output_rewrite", value=res_val, height=350, label_visibility="collapsed", placeholder="AI 重写后的内容将显示在这里...")

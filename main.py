@@ -4,179 +4,168 @@ import streamlit as st
 import os
 import pandas as pd
 import time
+import json
+import urllib.parse
 import sys
-import importlib 
-import streamlit.components.v1 as components 
 
-# ================= 0. 页面配置 =================
+# ==========================================
+# 1. 核心修复：工作区动态注入
+# ==========================================
+# 必须在导入 views 之前执行，确保所有模块使用同一个数据目录
+def resolve_workspace_path():
+    """解析真实的工作区路径"""
+    target_path = None
+    
+    # A. 优先检查 URL 参数 (run.py 传递)
+    try:
+        query_params = st.query_params
+        if "workspace" in query_params:
+            val = query_params["workspace"]
+            # 兼容处理: Streamlit 不同版本 query_params 行为差异
+            url_path = val if isinstance(val, str) else val[0]
+            decoded = urllib.parse.unquote(url_path)
+            if decoded and os.path.exists(decoded):
+                target_path = decoded
+    except: pass
+
+    # B. 其次检查配置文件 (run.py 生成的 workspace_config.json)
+    if not target_path:
+        # main.py 通常在 mortal_write 目录，config 可能在上一级(根目录)或同级
+        app_root = os.path.dirname(os.path.abspath(__file__))
+        possible_configs = [
+            os.path.join(app_root, 'workspace_config.json'),           # 同级
+            os.path.join(os.path.dirname(app_root), 'workspace_config.json') # 上一级
+        ]
+        
+        for cfg_path in possible_configs:
+            if os.path.exists(cfg_path):
+                try:
+                    with open(cfg_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        p = data.get('workspace_path')
+                        if p and os.path.exists(p):
+                            target_path = p; break
+                except: pass
+    
+    return target_path
+
+# 获取目标路径
+WORKSPACE_PATH = resolve_workspace_path()
+
+# ==========================================
+# 2. 动态 Patch Config 模块
+# ==========================================
+import config  # 先导入模块对象
+
+if WORKSPACE_PATH:
+    # 🔥 核心操作：强制修改 config 模块中的全局变量
+    # 这样后续所有 import config 的模块都会看到这个新路径
+    config.DATA_DIR = WORKSPACE_PATH
+    config.DB_FILE = os.path.join(WORKSPACE_PATH, "novels.db")
+    
+    # 确保目录存在
+    if not os.path.exists(config.DATA_DIR):
+        try: os.makedirs(config.DATA_DIR)
+        except: pass
+    
+    # 🔥 核心修改：防止日志刷屏
+    # 检查 session_state，只有当路径从未记录过或发生变化时才打印
+    if 'last_workspace_log' not in st.session_state or st.session_state.last_workspace_log != config.DATA_DIR:
+        print(f"🚀 [Main] Workspace switched to: {config.DATA_DIR}")
+        st.session_state.last_workspace_log = config.DATA_DIR
+
+else:
+    # 同样防止默认路径的日志刷屏
+    current_default = config.DATA_DIR
+    if 'last_workspace_log' not in st.session_state or st.session_state.last_workspace_log != current_default:
+        print(f"📂 [Main] Using default data dir: {current_default}")
+        st.session_state.last_workspace_log = current_default
+
+# ==========================================
+# 3. 正常导入业务逻辑
+# ==========================================
+# 从(可能被修改过的) config 对象中提取变量
+defaults = config.defaults
+DB_FILE = config.DB_FILE
+MODEL_MAPPING = config.MODEL_MAPPING
+AVAILABLE_MODELS = config.AVAILABLE_MODELS
+DATA_DIR = config.DATA_DIR
+
+from database import DatabaseManager
+from logic import LogicEngine, load_and_update_model_config
+from utils import (get_theme_css, render_sidebar, render_reading_modal)
+# 导入 Views 时，它们内部 import config 也会获取到上面修改后的 DATA_DIR
+from views import (dashboard, books, writer, structure, characters, knowledge, idea, settings, donate)
+
 st.set_page_config(
     page_title="凡人智能写作系统",
     page_icon="🗡️",
     layout="wide",
-    initial_sidebar_state="expanded" 
+    initial_sidebar_state="collapsed"
 )
 
-# 定义通信函数：向父窗口发送消息控制遮罩
-def send_mask_signal(action):
-    """
-    action: 'show_mask' 或 'hide_mask'
-    使用 window.top.postMessage 突破 iframe 跨域限制
-    """
-    js_code = f"""
-    <script>
-        try {{
-            window.top.postMessage('{action}', '*');
-        }} catch(e) {{
-            console.log('Failed to send message:', e);
-        }}
-    </script>
-    """
-    components.html(js_code, height=0, width=0)
-
-# ================= 1. 导入路径工具 =================
-from path_utils import save_workspace_config, select_folder_dialog, reset_workspace_config, get_executable_dir
-import database 
-
-# 核心修复：每次运行前检查是否需要强制刷新数据目录
-from path_utils import load_workspace_config
-_disk_path = load_workspace_config()
-
-if _disk_path and not database.DATA_DIR:
-    importlib.reload(database) 
-    if 'db' in st.session_state: del st.session_state['db']
-    if 'engine' in st.session_state: del st.session_state['engine']
-    st.rerun() 
-
-# ================= 2. 启动引导页 =================
-if not database.DATA_DIR:
-    # 🛑 在引导页：强制显示遮罩
-    send_mask_signal('show_mask')
-    
-    st.markdown("""
+# ==========================================
+# 4. 隐藏 Streamlit 右上角功能按钮
+# ==========================================
+st.markdown("""
     <style>
-    .big-title { font-size: 32px !important; font-weight: bold; color: #2e7d32; margin-bottom: 10px; text-align: center; }
-    .sub-title { font-size: 16px; color: #666; margin-bottom: 40px; text-align: center; }
-    .stButton button { width: 100%; border-radius: 8px; height: 50px; font-size: 18px; }
+    /* 隐藏右上角汉堡菜单和 Deploy 按钮 */
+    [data-testid="stToolbar"] {
+        display: none !important;
+        visibility: hidden !important;
+    }
+    [data-testid="stHeader"] {
+        display: none !important;
+        visibility: hidden !important;
+    }
+    .main .block-container {
+        padding-top: 1rem;
+    }
     </style>
-    """, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown('<div class="big-title">👋 欢迎使用凡人写作助手</div>', unsafe_allow_html=True)
-        st.markdown('<div class="sub-title">您的私人 AI 写作助手</div>', unsafe_allow_html=True)
-        
-        st.info("这是您第一次运行，请选择一个文件夹用于存储所有数据。")
-        
-        default_path = os.path.join(get_executable_dir(), "MortalWrite_Data")
-        if 'temp_selected_path' in st.session_state:
-            current_val = st.session_state['temp_selected_path']
-        else:
-            current_val = default_path
-            
-        path_display = st.text_input("数据存储位置：", value=current_val)
+# 确保子目录存在 (基于最终确认的 DATA_DIR)
+for d in ["logs", "pay", "projects/knowledge", "projects/images", "html", os.path.join(DATA_DIR, "relations")]:
+    if not os.path.exists(d): 
+        try: os.makedirs(d, exist_ok=True)
+        except: pass
 
-        col_pick, col_conf = st.columns([1, 1], gap="medium")
-        
-        with col_pick:
-            if st.button("📂 选择文件夹"):
-                selected = select_folder_dialog()
-                if selected:
-                    st.session_state['temp_selected_path'] = selected
-                    st.rerun()
-
-        with col_conf:
-            if st.button("✅ 确认并开始", type="primary"):
-                target_path = path_display.strip()
-                if not target_path:
-                    st.error("路径不能为空")
-                else:
-                    try:
-                        if not os.path.exists(target_path): os.makedirs(target_path)
-                        save_workspace_config(target_path)
-                        database.DATA_DIR = target_path
-                        
-                        st.success("初始化成功！正在进入...")
-                        
-                        # ⚠️ 修改：这里不再发送 hide_mask 信号
-                        # 让遮罩保持显示，直到 Rerun 完成进入下方的主程序逻辑后再隐藏
-                        # 这样可以盖住最后几秒的重载过程
-                        
-                        time.sleep(0.5)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"配置失败: {e}")
-    
-    st.stop() # 🛑 停止往下执行
-
-# ================= 3. 主程序加载 =================
-
-# ✅ 进入主程序：此时界面已准备好，发送信号隐藏遮罩
-send_mask_signal('hide_mask')
-
-from config import defaults
-from logic import LogicEngine, load_and_update_model_config
-from utils import get_theme_css, render_sidebar, render_reading_modal
-from views import dashboard, books, writer, structure, characters, knowledge, idea, settings, donate
-
-# 初始化数据库与引擎
-if 'db' not in st.session_state:
-    try:
-        st.session_state.db = database.DatabaseManager()
-    except Exception as e:
-        st.error(f"数据库连接失败: {e}")
-        from path_utils import reset_workspace_config
-        if st.button("重置配置"):
-            reset_workspace_config()
-            st.rerun()
-        st.stop()
-
-engine = LogicEngine(st.session_state.db)
-if 'engine' not in st.session_state:
-    st.session_state.engine = engine
-
+# 初始化 Session State
 for k, v in defaults.items():
     if k not in st.session_state: 
-        if k == 'batch_input_data' and v is None:
-             st.session_state[k] = pd.DataFrame([{'序号': 1, '章节标题': '', '大纲/摘要': ''}])
-        else:
-             st.session_state[k] = v
+        if k == 'current_theme' and v == "紫气东来 (默认)": st.session_state[k] = "紫气东来"
+        elif k == 'batch_input_data' and v is None: st.session_state[k] = pd.DataFrame([{'序号': 1, '章节标题': '示例', '大纲/摘要': '...'}])
+        else: st.session_state[k] = v
+
 if 'sidebar_collapsed' not in st.session_state: st.session_state.sidebar_collapsed = False
+if 'db' not in st.session_state: st.session_state.db = DatabaseManager(DB_FILE)
+engine = LogicEngine(st.session_state.db)
 
 st.markdown(get_theme_css(), unsafe_allow_html=True)
 
+# 处理 Rerun 标志
 if st.session_state.rerun_flag:
     st.session_state.rerun_flag = False
     time.sleep(0.1)
     st.rerun()
 
 # 布局渲染
-# 修改：稍微增加左侧导航栏的宽度比例，防止按钮换行 (1.5 -> 2)
-col_ratio = [0.6, 11] if st.session_state.sidebar_collapsed else [2, 10]
+if st.session_state.sidebar_collapsed: col_ratio = [0.6, 11]  
+else: col_ratio = [1.5, 10.5]
 c_nav, c_body = st.columns(col_ratio, gap="small")
 
 with c_nav:
     render_sidebar()
-    st.markdown("---")
-    
-    # 美化后的工作区设置
-    with st.expander("⚙️ 工作区", expanded=False): 
-        # 使用 st.code 显示路径，自动处理长文本，比 caption 更整洁
-        st.code(database.DATA_DIR, language="text")
-        
-        # 修改：缩短按钮文字，增加图标，避免换行
-        if st.button("🔄 切换目录", type="secondary", use_container_width=True): 
-            reset_workspace_config()
-            if 'db' in st.session_state: del st.session_state['db']
-            importlib.reload(database)
-            st.rerun() 
 
 with c_body:
     load_and_update_model_config(engine)
+    
+    # 阅读模式弹窗
     if st.session_state.reading_chapter_id:
         render_reading_modal(st.session_state.reading_chapter_id, st.session_state.db)
-        st.stop()
+        st.stop() 
 
+    # 获取当前数据上下文
     current_book = None
     if st.session_state.current_book_id:
         res = st.session_state.db.query("SELECT * FROM books WHERE id=?", (st.session_state.current_book_id,))
@@ -184,9 +173,12 @@ with c_body:
             
     current_chapter = None
     if st.session_state.current_chapter_id:
-        res = st.session_state.db.query("SELECT * FROM chapters WHERE id=?", (st.session_state.current_chapter_id,))
-        if res: current_chapter = dict(res[0])
+        chap_res = st.session_state.db.query("SELECT * FROM chapters WHERE id=?", (st.session_state.current_chapter_id,))
+        if chap_res:
+            current_chapter = dict(chap_res[0])
+            current_chapter['title'] = st.session_state.chapter_title_cache.get(st.session_state.current_chapter_id, current_chapter['title'])
 
+    # 路由
     menu = st.session_state.current_menu
     if menu == "dashboard": dashboard.render_dashboard(engine)
     elif menu == "books": books.render_books(engine)

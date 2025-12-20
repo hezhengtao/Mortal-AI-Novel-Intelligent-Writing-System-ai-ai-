@@ -1,4 +1,4 @@
-
+# mortal_write/views/__init__.py
 
 from . import dashboard
 from . import books

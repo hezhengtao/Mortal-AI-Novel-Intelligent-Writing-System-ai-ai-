@@ -1,0 +1,101 @@
+# MortalWrite.spec (智能路径检测版)
+# -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, copy_metadata
+import sys
+import os
+
+block_cipher = None
+
+# =========================================================
+# 🔥 1. 智能路径检测 (自动寻找 run.py)
+# =========================================================
+project_root = os.getcwd() # 获取当前运行命令的目录 D:\c\mortal_write
+
+# 检查 run.py 在哪里
+path_option_1 = os.path.join(project_root, 'mortal_write', 'run.py') # 子目录
+path_option_2 = os.path.join(project_root, 'run.py')               # 根目录
+
+if os.path.exists(path_option_1):
+    print(f"✅ 在子目录找到入口文件: {path_option_1}")
+    script_path = path_option_1
+    source_root = os.path.join(project_root, 'mortal_write') # 源码在子文件夹
+elif os.path.exists(path_option_2):
+    print(f"✅ 在根目录找到入口文件: {path_option_2}")
+    script_path = path_option_2
+    source_root = project_root # 源码就在根目录
+else:
+    raise FileNotFoundError(f"❌ 找不到 run.py! 请确认它在 {project_root} 或 {path_option_1}")
+
+# =========================================================
+# 2. 资源配置 (基于自动检测的路径)
+# =========================================================
+# 格式: (绝对源路径, 打包后的相对路径)
+my_datas = [
+    (os.path.join(source_root, 'main.py'), 'mortal_write'),
+    (os.path.join(source_root, 'database.py'), 'mortal_write'),
+    (os.path.join(source_root, 'path_utils.py'), 'mortal_write'),
+    (os.path.join(source_root, 'config.py'), 'mortal_write'),
+    (os.path.join(source_root, 'logic.py'), 'mortal_write'),
+    (os.path.join(source_root, 'utils.py'), 'mortal_write'),
+    (os.path.join(source_root, 'views'), 'mortal_write/views'),
+    (os.path.join(source_root, 'assets'), 'mortal_write/assets'),
+]
+
+# =========================================================
+# 3. 依赖与隐式导入
+# =========================================================
+metadata_packages = ['streamlit', 'tqdm', 'regex', 'requests', 'packaging', 'filelock', 'numpy', 'altair']
+for pkg in metadata_packages:
+    try: my_datas += copy_metadata(pkg)
+    except: pass
+
+my_hiddenimports = ['streamlit', 'streamlit.web.cli', 'webview', 'PIL', 'PIL.ImageTk', 'sqlite3', 'pandas', 'plotly', 'pyvis', 'engineio.async_drivers.threading']
+
+st_hiddenimports = collect_submodules('streamlit')
+st_datas = collect_data_files('streamlit')
+my_datas += st_datas
+my_hiddenimports += st_hiddenimports
+
+# =========================================================
+# 4. 分析与打包
+# =========================================================
+a = Analysis(
+    [script_path], # 🔥 使用自动找到的绝对路径
+    pathex=[project_root],
+    binaries=[],
+    datas=my_datas,
+    hiddenimports=my_hiddenimports,
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False
+)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='MortalWrite',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False, # 🔥 保持黑框开启以便调试
+    icon=os.path.join(source_root, 'assets', 'app.ico') # 自动适配图标路径
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='MortalWrite'
+)

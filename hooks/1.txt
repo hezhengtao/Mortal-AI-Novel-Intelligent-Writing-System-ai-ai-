@@ -1,0 +1,219 @@
+# mortal_write/run.py
+
+import os
+import sys
+import threading
+import time
+import socket
+import webview
+import http.server
+import socketserver
+import signal
+from streamlit.web import cli as stcli
+
+# ==========================================
+# 💉 核心补丁：屏蔽子线程信号报错
+# ==========================================
+original_signal = signal.signal
+def patched_signal(sig, handler):
+    if threading.current_thread() is threading.main_thread():
+        return original_signal(sig, handler)
+    return None
+signal.signal = patched_signal
+
+# ==========================================
+#  Globals
+# ==========================================
+WINDOW_INSTANCE = None 
+STREAMLIT_PORT = 0
+HTTP_PORT = 0
+STREAMLIT_READY = threading.Event()
+HTTP_READY = threading.Event()
+
+# ==========================================
+# 🕵️‍♂️ 资源搜寻 (采用您验证过的方案)
+# ==========================================
+def find_real_path(filename):
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    possible_paths = [
+        os.path.join(base_dir, filename),
+        os.path.join(base_dir, 'mortal_write', filename),
+        os.path.join(base_dir, '_internal', filename),
+        os.path.join(base_dir, '_internal', 'mortal_write', filename),
+        os.path.join(base_dir, 'mortal_write', 'assets') if filename == 'assets' else None,
+        os.path.join(base_dir, 'assets') if filename == 'assets' else None
+    ]
+
+    for path in possible_paths:
+        if path and os.path.exists(path):
+            if filename == 'assets':
+                if os.path.exists(os.path.join(path, 'splash.html')): return path
+            else: return path
+    return None
+
+# ==========================================
+# 🚀 后台服务
+# ==========================================
+def find_free_port(start=8501):
+    p = start
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('localhost', p)) != 0: return p
+        p += 1
+
+def run_streamlit_thread():
+    global STREAMLIT_PORT
+    STREAMLIT_PORT = find_free_port(8501)
+    main_py = find_real_path("main.py")
+    if not main_py:
+        print(f"❌ 致命错误: 无法找到 main.py")
+        return
+
+    threading.Thread(target=_check_streamlit_ready, daemon=True).start()
+
+    os.environ.update({"STREAMLIT_SERVER_PORT": str(STREAMLIT_PORT), "STREAMLIT_SERVER_HEADLESS": "true", "STREAMLIT_SERVER_FILE_WATCHER_TYPE": "none"})
+    sys.argv = ["streamlit", "run", main_py, "--server.port", str(STREAMLIT_PORT), "--global.developmentMode=false", "--server.headless=true", "--server.fileWatcherType=none"]
+
+    try: stcli.main()
+    except Exception as e: print(f"❌ Streamlit 发生错误: {e}")
+
+def _check_streamlit_ready():
+    while not STREAMLIT_READY.is_set():
+        if STREAMLIT_PORT > 0:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                if s.connect_ex(('localhost', STREAMLIT_PORT)) == 0:
+                    print("✅ Streamlit 服务已就绪。")
+                    STREAMLIT_READY.set()
+                    break
+        time.sleep(0.2)
+
+def run_http_thread():
+    global HTTP_PORT
+    HTTP_PORT = find_free_port(8000)
+    assets_dir = find_real_path("assets")
+    if not assets_dir:
+        print(f"❌ 致命错误: 无法找到 assets 目录")
+        return
+
+    os.chdir(assets_dir)
+    Handler = http.server.SimpleHTTPRequestHandler
+    Handler.log_message = lambda *args, **kwargs: None
+    with socketserver.TCPServer(("", HTTP_PORT), Handler) as httpd:
+        print(f"✅ 本地资源服务器已在 http://localhost:{HTTP_PORT} 启动。")
+        HTTP_READY.set()
+        httpd.serve_forever()
+
+# ==========================================
+# 🖥️ 前端主逻辑
+# ==========================================
+class Api:
+    def __init__(self): self.video_done = False
+    def video_ended(self): self.video_done = True
+    def minimize(self):
+        if WINDOW_INSTANCE: WINDOW_INSTANCE.minimize()
+    def toggle_maximize(self):
+        if WINDOW_INSTANCE: WINDOW_INSTANCE.toggle_maximize()
+    def close(self):
+        if WINDOW_INSTANCE: WINDOW_INSTANCE.destroy()
+
+def master_logic(window, api):
+    # 【最终优化】注入JS以移除进度条并开启声音
+    try:
+        print("🔧 尝试移除视频进度条并开启声音...")
+        js_to_run = """
+            var video = document.querySelector('video');
+            if (video) {
+                video.controls = false; // 移除控件
+                video.muted = false;    // 取消静音
+                console.log('✅ 视频控件已移除，并已尝试取消静音。');
+            }
+        """
+        window.evaluate_js(js_to_run)
+    except Exception as e:
+        print(f"❌ 注入JS时出错: {e}")
+
+    print("🚀 后台开始启动 Streamlit 主应用...")
+    t_st = threading.Thread(target=run_streamlit_thread, daemon=True)
+    t_st.start()
+
+    print("⌛ 等待启动视频播放完成 和 Streamlit服务就绪...")
+    STREAMLIT_READY.wait(timeout=60)
+    
+    start_wait_video = time.time()
+    while not api.video_done and (time.time() - start_wait_video < 30):
+        time.sleep(0.1)
+
+    if not STREAMLIT_READY.is_set():
+        print("❌ Streamlit 启动超时! 应用无法加载。")
+        window.destroy()
+        return
+
+    print("✨ 切换到主应用...")
+    window.evaluate_js('document.body.style.transition = "opacity 0.4s"; document.body.style.opacity = 0;')
+    time.sleep(0.4)
+    
+    window.load_url(f"http://localhost:{STREAMLIT_PORT}")
+    
+    inject_all_js(window)
+
+def inject_all_js(window):
+    js_code = """
+    (function() {
+        if (window.customControlsInjected) return;
+        window.customControlsInjected = true;
+        const controls_html = `<div id="custom-titlebar" style="position: fixed; top: 0; left: 0; right: 0; height: 32px; background: rgb(255, 255, 255); z-index: 9999; display: flex; justify-content: flex-end; align-items: center; user-select: none; -webkit-app-region: drag;"><div id="titlebar-title" style="flex-grow: 1; text-align: left; padding-left: 12px; font-family: sans-serif; font-size: 14px; color: #333;">凡人智能写作系统 Pro</div><div class="titlebar-button" style="width: 46px; height: 100%; display: flex; justify-content: center; align-items: center; transition: background-color 0.2s; -webkit-app-region: no-drag;" onclick="pywebview.api.minimize()"><svg width="10" height="10"><path d="M0,5 L10,5 Z" stroke="#333" stroke-width="1"></path></svg></div><div class="titlebar-button" style="width: 46px; height: 100%; display: flex; justify-content: center; align-items: center; transition: background-color 0.2s; -webkit-app-region: no-drag;" onclick="pywebview.api.toggle_maximize()"><svg width="10" height="10"><rect x="0" y="0" width="9" height="9" fill="none" stroke="#333" stroke-width="1"></rect></svg></div><div class="titlebar-button" id="close-btn" style="width: 46px; height: 100%; display: flex; justify-content: center; align-items: center; transition: background-color 0.2s; -webkit-app-region: no-drag;" onclick="pywebview.api.close()"><svg width="10" height="10"><path d="M0,0 L10,10 M10,0 L0,10 Z" stroke="#333" stroke-width="1.5"></path></svg></div></div>`;
+        const style = document.createElement('style');
+        style.textContent = `header[data-testid="stHeader"] { display: none !important; visibility: hidden !important; } .main > div:first-child { padding-top: 42px !important; } .titlebar-button:hover { background-color: #f0f0f0; } #close-btn:hover { background-color: #e81123; } #close-btn:hover svg path { stroke: #fff; }`;
+        document.head.appendChild(style);
+        let attempts = 0;
+        const intervalId = setInterval(() => {
+            if (document.body && !document.getElementById('custom-titlebar')) {
+                document.body.insertAdjacentHTML('beforeend', controls_html);
+                clearInterval(intervalId);
+            }
+            attempts++;
+            if (attempts > 50) clearInterval(intervalId);
+        }, 100);
+        document.body.style.opacity = 1;
+    })();
+    """;
+    window.evaluate_js(js_code)
+
+if __name__ == '__main__':
+    try:
+        t_http = threading.Thread(target=run_http_thread, daemon=True)
+        t_http.start()
+
+        print("⌛ 等待本地资源服务器启动...")
+        http_ready = HTTP_READY.wait(timeout=5)
+
+        if not http_ready:
+            print("❌ HTTP服务器启动超时，可能无法加载启动视频。")
+
+        try:
+            screen = webview.screens[0]
+            w, h = 1280, 800
+            x, y = int((screen.width - w) / 2), int((screen.height - h) / 2)
+        except Exception:
+            w, h, x, y = 1280, 800, None, None
+
+        api = Api()
+        WINDOW_INSTANCE = webview.create_window(
+            "Loading...",
+            url=f"http://localhost:{HTTP_PORT}/splash.html" if http_ready else None,
+            width=w, height=h, x=x, y=y,
+            frameless=True, on_top=True,
+            js_api=api,
+            background_color='#000000',
+            resizable=True
+        )
+
+        webview.start(master_logic, (WINDOW_INSTANCE, api), gui='edgechromium', debug=True)
+
+    except Exception as e:
+        print(f"发生致命错误: {e}")
+        time.sleep(10)

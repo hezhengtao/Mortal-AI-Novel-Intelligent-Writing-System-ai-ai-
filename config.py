@@ -1,11 +1,13 @@
-
-
 import os
 import pandas as pd
 
 # ================= 0. 全局配置 & 常量 =================
 
-DB_FILE = "mortal_write.db"
+# 🚨 修正：根据文件结构图，修正 DB 文件名
+DB_FILE = "novels.db"
+
+# 🛠️ 修正：新增 DATA_DIR 供 views/dashboard.py 和其他模块使用
+DATA_DIR = "data"
 
 # --- 主题定义 ---
 THEMES = {
@@ -202,7 +204,7 @@ FEATURE_MODELS = {
     "knowledge_analyze": {"name": "拆书知识 - 风格/设定分析", "default": "GPT_4o_Mini"},
     "books_arch_gen": {"name": "书籍管理 - 架构/图谱生成", "default": "DSK_V3"},
     "import_char_analysis": {"name": "书籍导入 - 简介/分析", "default": "DSK_V3"}, 
-    "character_extract": {"name": "角色管理 - 智能提取", "default": "GPT_4o"}, # 🔥 新增项
+    "character_extract": {"name": "角色管理 - 智能提取", "default": "GPT_4o"}, 
     "idea_generation": {"name": "灵感模式 - 点子生成", "default": "GPT_4o_Mini"},
 }
 

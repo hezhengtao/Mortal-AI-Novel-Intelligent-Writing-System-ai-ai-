@@ -1,0 +1,87 @@
+
+        <!DOCTYPE html><html lang="zh-CN">
+        <head>
+            <meta charset="UTF-8">
+            <style>
+                @font-face { font-family: 'Longyin'; src: url('/Longyin.ttf') format('truetype'); }
+                * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; } 
+                body, html { width:100%; height:100%; overflow:hidden; background-color:#000000; font-family: 'Longyin', system-ui, sans-serif; }
+                #splash-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9998; opacity: 0; background-color: #000; pointer-events: none; }
+                #loading-text-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10000; background-color: #000; color: #fff; font-size: 6em; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; animation: fadeInText 2.0s cubic-bezier(0.1, 0, 0, 1) forwards; }
+                @keyframes fadeInText { 0% { opacity: 0; letter-spacing: 50px; filter: blur(30px); transform: scale(1.05); } 100% { opacity: 1; letter-spacing: 12px; filter: blur(0px); transform: scale(1); } }
+                @keyframes finalFadeOut { from { opacity: 1; letter-spacing: 12px; filter: blur(0px); transform: scale(1); } to { opacity: 0; letter-spacing: 12px; filter: blur(5px); transform: scale(1); } }
+                @keyframes finalFadeIn { from { opacity: 0; } to { opacity: 1; } }
+                #splash-video { width: 100%; height: 100%; object-fit: cover; display: block; }
+                #workspace-modal { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10001; background-color: rgba(0, 0, 0, 0.6); display: flex; flex-direction: column; justify-content: center; align-items: center; opacity: 0; pointer-events: none; color: white; backdrop-filter: blur(5px); transition: opacity 0.5s ease; }
+                .ws-content { width: 450px; text-align: center; }
+                .ws-title { font-size: 2.2em; margin-bottom: 40px; letter-spacing: 4px; color: #eee; }
+                .ws-path-box { border: 1px solid #444; padding: 15px; margin-bottom: 30px; font-family: sans-serif; font-size: 14px; color: #aaa; background: rgba(255,255,255,0.05); border-radius: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                .ws-btn-group { display: flex; gap: 20px; justify-content: center; }
+                .ws-btn { padding: 10px 30px; border: 1px solid #666; background: transparent; color: #ccc; font-family: 'Longyin', sans-serif; font-size: 1.3em; cursor: pointer; transition: all 0.3s; border-radius: 4px; }
+                .ws-btn:hover { border-color: #fff; color: #fff; background: rgba(255,255,255,0.1); }
+                .ws-btn.primary { border-color: #fff; background: #fff; color: #000; }
+                .ws-btn.primary:hover { background: #ddd; }
+                #loading-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9998; background-color: #000000; display: none; flex-direction: column; justify-content: center; align-items: center; opacity: 0; transition: opacity 0.5s ease; }
+                .spinner { width: 50px; height: 50px; border: 4px solid #333; border-top: 4px solid #fff; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px; }
+                .loading-text { font-family: sans-serif; color: #aaa; font-size: 1.0em; letter-spacing: 1px; }
+                @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                #parent-controls { position: fixed; top: 0; left: 0; width: 100%; height: 32px; z-index: 99999; opacity: 1; background-color: #f9f9f9; display: flex; justify-content: space-between; align-items: center; pointer-events: none; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+                .titlebar-title { padding-left: 12px; font-family: sans-serif; font-size: 14px; color: #333; -webkit-app-region: drag; pointer-events: auto; flex-grow: 1; }
+                .titlebar-buttons { pointer-events: auto; display: flex; flex-shrink: 0; } 
+                .titlebar-button { display: flex; justify-content: center; align-items: center; width: 46px; height: 32px; cursor: pointer; transition: background-color 0.2s; }
+                .titlebar-button:hover { background-color: #e5e5e5; } 
+                #close-btn:hover { background-color: #e81123; } #close-btn:hover svg path { stroke: #fff; }
+                #app-container { position: absolute; top: 32px; left: 0; width: 100%; height: calc(100% - 32px); background-color: #000000; z-index: 1; opacity: 0; }
+            </style>
+            <script>
+                function checkUrlAndShowWorkspace() {
+                    const params = new URLSearchParams(window.location.search);
+                    const pathFromUrl = params.get('workspace');
+                    const displayBox = document.getElementById('selected-path-text');
+                    
+                    if (pathFromUrl && pathFromUrl.length > 1) { 
+                        displayBox.innerText = pathFromUrl; 
+                        handleEnterSystem(); 
+                    } else { 
+                        if (displayBox.innerText === '') displayBox.innerText = '请选择目录'; 
+                        showWorkspaceSelector();
+                    }
+                }
+                function showWorkspaceSelector() { document.getElementById('workspace-modal').style.opacity = "1"; document.getElementById('workspace-modal').style.pointerEvents = "auto"; }
+                function handleSelectFolder() { pywebview.api.select_folder().then(function(path) { if (path) document.getElementById('selected-path-text').innerText = path; }); }
+                function handleEnterSystem() { 
+                    const path = document.getElementById('selected-path-text').innerText;
+                    let targetSrc = 'http://localhost:8501/';
+                    if (path && path !== '请选择目录') { targetSrc = 'http://localhost:8501/?workspace=' + encodeURIComponent(path); }
+                    document.getElementById('loading-overlay').style.display = 'flex';
+                    document.getElementById('loading-overlay').style.opacity = '1';
+                    document.getElementById('app-frame').src = targetSrc;
+                    pywebview.api.enter_system(); 
+                }
+                function onAppFrameLoad() { setTimeout(function() { pywebview.api.app_ready_trigger(); }, 1500); }
+                function onVideoEnded() { pywebview.api.signal_video_ended(); checkUrlAndShowWorkspace(); }
+            </script>
+        </head>
+        <body>
+            <div id="loading-text-container">凡人智能写作系统</div>
+            <div id="splash-container"><video id="splash-video" onended="onVideoEnded()"></video></div>
+            <div id="workspace-modal">
+                <div class="ws-content">
+                    <div class="ws-title">请选择创作空间</div>
+                    <div class="ws-path-box" id="selected-path-text"></div> 
+                    <div class="ws-btn-group"><button class="ws-btn" onclick="handleSelectFolder()">浏览目录</button><button class="ws-btn primary" onclick="handleEnterSystem()">进入系统</button></div>
+                </div>
+            </div>
+            <div id="loading-overlay"><div class="spinner"></div><div class="loading-text">正在初始化系统...</div></div>
+            <div id="app-container"><iframe id="app-frame" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-downloads allow-modals" style="width:100%;height:100%;border:none;background-color:#000;" onload="onAppFrameLoad()"></iframe></div>
+            <div id="parent-controls">
+                <div class="titlebar-title">凡人智能写作系统</div>
+                <div class="titlebar-buttons">
+                    <div class="titlebar-button" onclick="pywebview.api.change_workspace()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></div>
+                    <div class="titlebar-button" onclick="pywebview.api.minimize()"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0,5 L10,5" stroke="#333" stroke-width="1"></path></svg></div>
+                    <div class="titlebar-button" id="toggle-maximize-btn" onclick="pywebview.api.toggle_maximize()"><svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="#333" stroke-width="1"></rect></svg></div>
+                    <div class="titlebar-button" id="close-btn" onclick="pywebview.api.close()"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0,0 L10,10 M10,0 L0,10" stroke="#333" stroke-width="1.5"></path></svg></div>
+                </div>
+            </div>
+        </body></html>
+        

@@ -6,11 +6,13 @@ from utils import (
     render_header, 
     generate_export_content_from_ids,
     log_operation,
-    ensure_log_file
+    ensure_log_file,
+    save_file_locally,  # <--- 新增导入
+    show_export_success_modal # <--- 新增导入
 )
 
 # ==============================================================================
-#  CSS 样式注入 (美化阅读器 & 界面微调)
+# 🎨 CSS 样式注入 (美化阅读器 & 界面微调)
 # ==============================================================================
 def inject_custom_css():
     st.markdown("""
@@ -71,7 +73,7 @@ def inject_custom_css():
     """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 核心辅助逻辑
+# 🛠️ 核心辅助逻辑
 # ==============================================================================
 
 def _ensure_schema(db_mgr):
@@ -116,7 +118,7 @@ def set_selection(node_type, node_id):
     keys_to_clear = [k for k in st.session_state.keys() if k.startswith('prop_') or k.startswith('temp_content_')]
 
 # ==============================================================================
-# Dialogs (模态弹窗)
+# 🪟 Dialogs (模态弹窗)
 # ==============================================================================
 
 if hasattr(st, "dialog"):
@@ -214,22 +216,23 @@ def dialog_global_export(book_id, book_title):
         
         col_dl, col_close = st.columns([2, 1])
         with col_dl:
-            
-            st.download_button(
-                label=f"📥 下载 ({len(selected_labels)}章)",
-                data=txt_content,
-                file_name=f"{book_title}_导出.txt",
-                mime="text/plain",
+            # 🔥 修改：接入弹窗
+            if st.button(
+                label=f"📥 导出 ({len(selected_labels)}章)",
                 type="primary",
                 use_container_width=True,
-                on_click=audit_export_callback,
-                args=("数据导出", f"全局导出书籍: 《{book_title}》 (共{len(selected_labels)}章)")
-            )
+                key="btn_global_export_action"
+            ):
+                success, saved_path = save_file_locally(f"{book_title}_导出.txt", txt_content)
+                if success:
+                    audit_export_callback("数据导出", f"全局导出书籍: 《{book_title}》 (共{len(selected_labels)}章)")
+                    show_export_success_modal(saved_path) # <--- 调用弹窗
+                
         with col_close:
              if st.button("关闭", use_container_width=True):
                  st.rerun()
 
-
+# --- 删除确认弹窗 ---
 @dialog_decorator("⚠️ 删除确认")
 def dialog_delete_confirm(node_type, node_id, node_name):
     st.warning(f"确定要删除 {node_name} 吗？")
@@ -261,14 +264,14 @@ def dialog_delete_confirm(node_type, node_id, node_name):
             elif node_type == 'chap':
                 db_mgr.execute("DELETE FROM chapters WHERE id=?", (node_id,))
             
-           
+            # 🔥 修改：确保日志文件存在
             ensure_log_file()
             log_operation("架构删除", f"删除 {node_type} ID:{node_id}")
             st.session_state.struct_sel_id = None
             st.session_state.struct_sel_type = None
             st.rerun()
 
-
+# --- 保存确认弹窗 ---
 @dialog_decorator("💾 保存确认")
 def dialog_save_confirm(node_type, node_id, new_data):
     st.markdown(f"**正在保存 {new_data['name']}**")
@@ -306,7 +309,7 @@ def dialog_save_confirm(node_type, node_id, new_data):
                 st.error(f"保存失败: {e}")
 
 # ==============================================================================
-# 左侧目录树渲染逻辑
+# 🌲 左侧目录树渲染逻辑
 # ==============================================================================
 
 def render_tree_view(db_mgr, current_book_id):
@@ -320,7 +323,7 @@ def render_tree_view(db_mgr, current_book_id):
         with st.expander(f"{part['name']}", expanded=False):
             c1, c2 = st.columns([1, 1])
             if c1.button("编辑信息", key=f"btn_ed_p_{part['id']}", use_container_width=True):
-                # 修改：添加浏览日志
+                # 🔥 修改：添加浏览日志
                 ensure_log_file()
                 log_operation("查看节点", f"查看篇信息: {part['name']}")
                 set_selection('part', part['id'])
@@ -335,7 +338,7 @@ def render_tree_view(db_mgr, current_book_id):
                 with st.expander(f"{vol['name']}", expanded=False):
                     cv1, cv2 = st.columns([1, 1])
                     if cv1.button("编辑信息", key=f"btn_ed_v_{vol['id']}", use_container_width=True):
-                        # 修改：添加浏览日志
+                        # 🔥 修改：添加浏览日志
                         ensure_log_file()
                         log_operation("查看节点", f"查看卷信息: {vol['name']}")
                         set_selection('vol', vol['id'])
@@ -353,7 +356,7 @@ def render_tree_view(db_mgr, current_book_id):
                             is_active = (st.session_state.get('struct_sel_type') == 'chap' and st.session_state.get('struct_sel_id') == chap['id'])
                             type_ = "primary" if is_active else "secondary"
                             if st.button(f"{chap['title']}", key=f"btn_c_{chap['id']}", use_container_width=True, type=type_):
-                                #  修改：添加阅读日志
+                                # 🔥 修改：添加阅读日志
                                 ensure_log_file()
                                 log_operation("阅读章节", f"在架构页阅读章节: {chap['title']}")
                                 set_selection('chap', chap['id'])
@@ -361,7 +364,7 @@ def render_tree_view(db_mgr, current_book_id):
                 st.markdown("<div style='height: 5px'></div>", unsafe_allow_html=True)
 
 # ==============================================================================
-# 📝右侧属性面板逻辑 (含顶部操作栏)
+# 📝 右侧属性面板逻辑 (含顶部操作栏)
 # ==============================================================================
 
 def render_properties_panel(db_mgr, current_book_id):
@@ -422,15 +425,17 @@ def render_properties_panel(db_mgr, current_book_id):
             
     with c_tools_3:
         if sel_type == 'chap':
-            # 修改：绑定下载审计回调
-            st.download_button(
+            # 🔥 修改：接入弹窗
+            if st.button(
                 "📥 导出此章", 
-                data=f"{db_name}\n\n{db_content}", 
-                file_name=f"{db_name}.txt", 
                 use_container_width=True,
-                on_click=audit_export_callback,
-                args=("数据导出", f"单章导出: {db_name}")
-            )
+                key="top_btn_export_chap"
+            ):
+                content_to_save = f"{db_name}\n\n{db_content}"
+                success, saved_path = save_file_locally(f"{db_name}.txt", content_to_save)
+                if success:
+                    audit_export_callback("数据导出", f"单章导出: {db_name}")
+                    show_export_success_modal(saved_path) # <--- 调用弹窗
             
     st.markdown("---")
 
@@ -493,7 +498,7 @@ def render_properties_panel(db_mgr, current_book_id):
             )
 
 # ==============================================================================
-# 主渲染入口
+# 🚀 主渲染入口
 # ==============================================================================
 
 def render_structure(engine, current_book):
@@ -519,7 +524,7 @@ def render_structure(engine, current_book):
         selected_title = st.selectbox("当前书籍", list(book_opts.keys()), index=default_idx, label_visibility="collapsed", key="struct_book_sel")
         selected_book_id = book_opts[selected_title]
         
-        # 修改：添加书籍切换日志
+        # 🔥 修改：添加书籍切换日志
         if selected_book_id != st.session_state.current_book_id:
             ensure_log_file()
             log_operation("页面跳转", f"架构页切换书籍: 《{selected_title}》")

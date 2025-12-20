@@ -1,16 +1,22 @@
-
+# mortal_write/utils.py
 
 import streamlit as st
 import os
 import shutil
 import base64
-import time 
-import csv 
-import pandas as pd 
+import time
+import csv
+import pandas as pd
 import streamlit.components.v1 as components
-from config import THEMES 
+import config  # 确保 config.py 存在
+from config import THEMES
+from datetime import datetime
+import sys
+import subprocess
+import urllib.parse  # 用于解析URL参数
+import re  # <--- 🔥 新增：用于正则替换非法字符
 
-
+# 尝试导入 pyvis，如果失败则使用 Mock 防止报错
 try:
     from pyvis.network import Network
 except ImportError:
@@ -20,21 +26,37 @@ except ImportError:
     Network = MockNetwork
     components = None
 
+# ==============================================================================
+# 日志审计系统
+# ==============================================================================
 
-LOG_DIR = "logs"
-LOG_FILE = os.path.join(LOG_DIR, "system_log.csv")
+def get_log_dir():
+    """获取日志目录，基于 config.DATA_DIR"""
+    d = os.path.join(config.DATA_DIR, "logs")
+    if not os.path.exists(d): 
+        os.makedirs(d, exist_ok=True)
+    return d
+
+def get_log_file_path():
+    """返回日志文件的物理路径"""
+    return os.path.join(get_log_dir(), "system_log.csv")
+
+def get_ntp_time():
+    """获取当前格式化时间"""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 def ensure_log_file():
-    if not os.path.exists(LOG_DIR):
-        os.makedirs(LOG_DIR)
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'w', newline='', encoding='utf-8-sig') as f:
+    """确保日志目录和文件存在，并初始化表头"""
+    log_file = get_log_file_path()
+    if not os.path.exists(log_file) or os.path.getsize(log_file) == 0:
+        with open(log_file, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            writer.writerow(['time', 'action', 'details'])
+            writer.writerow(['时间', '操作', '详情'])
 
 def log_operation(action, details=""):
-    """记录操作日志"""
-    current_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    """记录操作日志到 session 和 CSV 文件"""
+    current_time = get_ntp_time()
+    
     if 'operation_logs' not in st.session_state:
         st.session_state.operation_logs = []
     
@@ -43,24 +65,130 @@ def log_operation(action, details=""):
     
     try:
         ensure_log_file()
-        with open(LOG_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+        clean_details = str(details).replace('\n', ' ').replace('\r', '')
+        with open(get_log_file_path(), 'a', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            writer.writerow([current_time, action, details])
+            writer.writerow([current_time, action, clean_details])
     except Exception as e:
-        print(f"日志写入失败: {e}")
+        print(f"❌ Log Error: {e}")
 
 # ==============================================================================
-# 🛠️ 核心功能区域
+# 核心功能区域 (文件导出与工作区管理)
 # ==============================================================================
+
+def get_current_workspace():
+    """从 URL 参数中获取当前工作区路径 (由 run.py 传递)"""
+    try:
+        # 获取 URL 参数 (兼容新旧版本 Streamlit API)
+        params = st.query_params
+        ws_path = params.get("workspace", None)
+        
+        if ws_path:
+            # URL 解码 (处理中文路径)
+            decoded_path = urllib.parse.unquote(ws_path)
+            # 简单验证路径是否存在
+            if os.path.exists(decoded_path):
+                return decoded_path
+    except Exception:
+        pass
+    
+    # 如果没有工作区或解析失败，回退到 EXE 同级目录或当前脚本目录
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+def open_local_folder(folder_path):
+    """跨平台打开本地文件夹"""
+    try:
+        if sys.platform == 'win32':
+            os.startfile(folder_path)
+        elif sys.platform == 'darwin':
+            subprocess.call(['open', folder_path])
+        else:
+            subprocess.call(['xdg-open', folder_path])
+    except Exception as e:
+        st.error(f"打开文件夹失败: {e}")
+
+# --- 导出成功模态弹窗 ---
+if hasattr(st, "dialog"):
+    dialog_decorator = st.dialog
+else:
+    dialog_decorator = st.experimental_dialog
+
+@dialog_decorator("✅ 导出成功")
+def show_export_success_modal(file_path):
+    """显示导出成功的模态弹窗"""
+    folder_path = os.path.dirname(file_path)
+    file_name = os.path.basename(file_path)
+    
+    st.markdown(f"""
+    <div style="padding: 10px 0; font-size: 16px;">
+        文件 <b>{file_name}</b> 已成功保存。
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 显示路径 (只读文本框，方便查看和复制)
+    st.text_input("保存路径", value=file_path, disabled=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        # 按钮回调：打开文件夹
+        if st.button("📂 打开文件夹", type="primary", use_container_width=True):
+            open_local_folder(folder_path)
+    with col2:
+        if st.button("关闭", use_container_width=True):
+            st.rerun()
+
+def save_file_locally(filename, content, folder_name="Exports"):
+    """
+    将内容保存到 [工作区]/Exports 目录 (自动清洗文件名)
+    返回: (success: bool, full_path: str)
+    """
+    try:
+        # 1. 获取基础路径 (优先使用 run.py 传递的工作区)
+        base_dir = get_current_workspace()
+
+        # 2. 创建导出目录
+        export_dir = os.path.join(base_dir, folder_name)
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+
+        # 3. 🔥 核心修复：文件名清洗
+        # 将 Windows/Linux/Mac 文件名中的非法字符替换为下划线 "_"
+        # 非法字符包括: \ / : * ? " < > |
+        safe_filename = re.sub(r'[\\/*?:"<>|]', '_', filename).strip()
+        
+        # 防止清洗后文件名为空
+        if not safe_filename:
+            safe_filename = f"unnamed_file_{int(time.time())}.txt"
+
+        file_path = os.path.join(export_dir, safe_filename)
+
+        # 4. 写入文件 (支持文本和二进制)
+        if isinstance(content, bytes):
+            with open(file_path, "wb") as f:
+                f.write(content)
+        else:
+            with open(file_path, "w", encoding='utf-8') as f:
+                f.write(content)
+
+        # 5. 返回成功状态和路径，不再直接弹窗，交给 UI 层处理
+        return True, file_path
+            
+    except Exception as e:
+        st.error(f"导出失败: {e}")
+        return False, None
 
 def save_avatar_file(uploaded_file, char_id):
-    """🔥 修复：新增，用于保存角色头像文件"""
+    """保存角色头像文件"""
     if uploaded_file is None: return None
     
-    # 确保存储目录存在
-    save_dir = "static/avatars"
+    save_dir = os.path.join(config.DATA_DIR, "avatars")
     if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
         
     try:
         file_ext = os.path.splitext(uploaded_file.name)[1]
@@ -76,24 +204,40 @@ def save_avatar_file(uploaded_file, char_id):
         return None
 
 def reset_all_settings(db_mgr):
+    """执行全量数据重置"""
     try:
-        for table in ["configs", "books", "volumes", "chapters", "characters", "plots"]:
-            db_mgr.execute(f"DELETE FROM {table}")
+        # 1. 清空数据库表
+        tables = ["configs", "books", "volumes", "chapters", "characters", "plots"]
+        for table in tables:
+            try: db_mgr.execute(f"DELETE FROM {table}")
+            except: pass
         
+        # 2. 清空 Session (保留 db 连接)
         keys_to_reset = list(st.session_state.keys())
         for k in keys_to_reset:
             if k != 'db': del st.session_state[k]
             
+        # 3. 清除 DATA_DIR 下的相关物理文件
+        targets = [
+            os.path.join(config.DATA_DIR, "logs"),
+            os.path.join(config.DATA_DIR, "images"), 
+            os.path.join(config.DATA_DIR, "avatars"),
+            os.path.join(config.DATA_DIR, "html"),
+            os.path.join(config.DATA_DIR, "relations")
+        ]
         
-        for p in ["logs", "projects/images", "html", "static/avatars"]:
-            if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
-            elif os.path.isfile(p): os.remove(p)
+        for p in targets:
+            if os.path.isdir(p): 
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.isfile(p): 
+                os.remove(p)
             
-        st.success("数据已清除。")
+        st.success("所有数据已完全清除。")
+        time.sleep(1)
         st.rerun()
     except Exception as e:
-        st.error(f"失败: {e}")
-        
+        st.error(f"系统重置失败: {e}")
+
 def get_svg_uri(svg_str, color):
     svg_str = svg_str.replace("{COLOR}", color)
     b64 = base64.b64encode(svg_str.encode('utf-8')).decode('utf-8')
@@ -101,8 +245,10 @@ def get_svg_uri(svg_str, color):
 
 def render_pyvis_graph(net, key):
     if components is None: return
-    path = 'html'
+    
+    path = os.path.join(config.DATA_DIR, 'html')
     if not os.path.exists(path): os.makedirs(path)
+    
     full_path = os.path.join(path, f'pyvis_chart_{key}.html')
     try:
         net.save_graph(full_path)
@@ -110,6 +256,9 @@ def render_pyvis_graph(net, key):
             components.html(f.read(), height=620)
     except: pass
 
+# ==============================================================================
+# UI 渲染函数 (保留原逻辑)
+# ==============================================================================
 
 def get_theme_css():
     current_name = st.session_state.get('current_theme', '翡翠森林')
@@ -152,7 +301,7 @@ def get_theme_css():
     try: p_r, p_g, p_b = int(primary[1:3],16), int(primary[3:5],16), int(primary[5:7],16)
     except: p_r, p_g, p_b = 66, 185, 131
 
-    css = f"""
+    return f"""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&display=swap');
         :root {{ --primary-color: {primary} !important; --text-color: {c_text_main} !important; --background-color: {c_bg_app} !important; --secondary-background-color: {c_bg_sidebar} !important; accent-color: {primary} !important; }}
@@ -193,68 +342,31 @@ def get_theme_css():
         [data-testid="stAlert"] svg {{ fill: {primary} !important; color: {primary} !important; }}
     </style>
     """
-    return css
 
 def nav_callback(key):
     st.session_state.current_menu = key
 
-
 def get_sidebar_stats(db_mgr):
-    """
-    获取侧边栏实时统计数据 (仅当前书籍)
-    """
     try:
-        # 1. 实时会话消耗 (仅本次运行)
         cost = st.session_state.token_tracker.get('cost', 0.0)
-        
-        # 2. 当前书籍信息
         current_book_id = st.session_state.get('current_book_id')
         current_book_title = "未选书籍"
         total_chapters = 0
         total_words = 0
         total_volumes = 0
-        
         if current_book_id:
-            # 标题
             res = db_mgr.query("SELECT title FROM books WHERE id=?", (current_book_id,))
-            if res:
-                current_book_title = res[0]['title']
-            
-            # 统计当前书的章节数和字数
-            stats_res = db_mgr.query("""
-                SELECT count(c.id) as c, sum(length(c.content)) as w 
-                FROM chapters c 
-                JOIN volumes v ON c.volume_id = v.id 
-                WHERE v.book_id = ?
-            """, (current_book_id,))
-            
+            if res: current_book_title = res[0]['title']
+            stats_res = db_mgr.query("SELECT count(c.id) as c, sum(length(c.content)) as w FROM chapters c JOIN volumes v ON c.volume_id = v.id WHERE v.book_id = ?", (current_book_id,))
             if stats_res:
                 total_chapters = stats_res[0]['c'] if stats_res[0]['c'] else 0
                 total_words = stats_res[0]['w'] if stats_res[0]['w'] else 0
-                
-            # 统计当前书的卷数
             vol_res = db_mgr.query("SELECT count(*) as c FROM volumes WHERE book_id=?", (current_book_id,))
-            if vol_res:
-                total_volumes = vol_res[0]['c']
-        
-        # 格式化字数 (k/w)
-        if total_words > 10000:
-            words_display = f"{total_words/10000:.1f}万"
-        else:
-            words_display = f"{total_words}"
-
-        return {
-            "title": current_book_title,
-            "cost": f"¥{cost:.2f}",
-            "volumes": total_volumes,
-            "chapters": total_chapters,
-            "words": words_display
-        }
-    except Exception as e: 
-        print(f"Monitor Error: {e}")
-        return {
-            "title": "N/A", "cost": "0.00", "volumes": 0, "chapters": 0, "words": "0"
-        }
+            if vol_res: total_volumes = vol_res[0]['c']
+        words_display = f"{total_words/10000:.1f}万" if total_words > 10000 else f"{total_words}"
+        return {"title": current_book_title, "cost": f"¥{cost:.2f}", "volumes": total_volumes, "chapters": total_chapters, "words": words_display}
+    except Exception: 
+        return {"title": "N/A", "cost": "0.00", "volumes": 0, "chapters": 0, "words": "0"}
 
 def render_sidebar():
     collapsed = st.session_state.get('sidebar_collapsed', False)
@@ -292,14 +404,11 @@ def render_sidebar():
             btn_type = "primary" if is_active else "secondary"
             st.button(btn_label, key=f"nav_{key}", use_container_width=True, type=btn_type, on_click=nav_callback, args=(key,))
 
-        
         if not collapsed:
             stats = get_sidebar_stats(st.session_state.db)
-            
-           
             st.markdown(f"""
             <div style='background-color:rgba({primary_rgb_str}, 0.06); padding:12px; border-radius:8px; margin-top:15px; border:1px solid rgba({primary_rgb_str}, 0.15);'>
-                <div style='color:{primary}; font-weight:700; margin-bottom:10px; font-size:13px; border-bottom:1px dashed rgba({primary_rgb_str}, 0.3); padding-bottom:6px; line-height: 1.4; word-wrap: break-word; overflow-wrap: break-word;'>
+                <div style='color:{primary}; font-weight:700; margin-bottom:10px; font-size:13px; border-bottom:1px dashed rgba({primary_rgb_str}, 0.3); padding-bottom:6px; line-height: 1.4; word-wrap: break-word;'>
                     📖 {stats['title']}
                 </div>
                 <div style='display: flex; flex-direction: column; gap: 8px; color: {primary}; opacity: 0.9;'>
@@ -322,7 +431,6 @@ def render_sidebar():
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            
         else:
              st.markdown(f"""<div style='margin-top:10px; text-align:center; font-size:10px; color:{primary}; border-top:1px solid rgba(0,0,0,0.1); padding-top:5px;'><div title='当前书籍'>📖</div><div style='margin-top:4px;' title='字数'>✒️</div></div>""", unsafe_allow_html=True)
 
@@ -332,23 +440,17 @@ def render_header(icon, title):
     primary = theme.get('primary', '#3eaf7c')
     grad_a = theme.get('grad_a', primary)
     grad_b = theme.get('grad_b', '#888')
-    st.markdown(f"""<div style='display:flex;align-items:center; padding-bottom:10px; margin-bottom:20px; margin-top:0px;'><span style='font-size:36px;margin-right:15px; filter: drop_shadow(0 4px 6px rgba(0,0,0,0.1));'>{icon}</span><span class='grad-text' style='background: linear-gradient(135deg, {grad_a}, {grad_b}); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 32px; font-weight: 800;'>{title}</span></div>""", unsafe_allow_html=True)
-
-def render_fixed_top_header(): pass
+    st.markdown(f"""<div style='display:flex;align-items:center; padding-bottom:10px; margin-bottom:20px;'><span style='font-size:36px;margin-right:15px;'>{icon}</span><span class='grad-text' style='background: linear-gradient(135deg, {grad_a}, {grad_b}); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 32px; font-weight: 800;'>{title}</span></div>""", unsafe_allow_html=True)
 
 def render_reading_modal(chap_id, db_mgr):
-    current_name = st.session_state.get('current_theme', '翡翠森林')
-    theme = THEMES.get(current_name, list(THEMES.values())[0])
-    primary = theme.get('primary', '#3eaf7c')
     chap = db_mgr.query("SELECT c.title, c.content, v.name as vol_name FROM chapters c JOIN volumes v ON c.volume_id = v.id WHERE c.id=?", (chap_id,))
     if not chap: return
     chap = chap[0]
-    modal = st.empty()
-    with modal:
-        st.markdown(f"""<div style='position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.4); backdrop-filter: blur(5px); z-index: 2000; display: flex; justify-content: center; align-items: center;'><div style='background: white; padding: 40px; border-radius: 20px; width: 800px; max-width: 90%; max-height: 85vh; overflow-y: auto; box-shadow: 0 20px 50px rgba(0,0,0,0.2);'><div style='display: flex; justify-content: space-between; align-items: center; margin-bottom:20px;'><h3 style='margin: 0; color: {primary}; font-weight:700;'>📖 {chap['vol_name']} - {chap['title']}</h3></div><div style='white-space: pre-wrap; line-height: 1.8; color: #333; font-size: 17px; font-family: "Georgia", serif;'>{chap['content'].replace('\\n', '<br>') or '章节内容为空'}</div><div style='text-align: right; margin-top: 30px;'><button id="close_modal" style='padding: 10px 24px; background-color: {primary}; color: white; border: none; border-radius: 20px; cursor: pointer; font-weight:600; box-shadow: 0 4px 12px rgba(0,0,0,0.15);'>关闭阅读</button></div></div></div>""", unsafe_allow_html=True)
-        if st.button("❌ 关闭预览", key="close_read_modal", help="隐藏按钮", type="secondary"):
-            st.session_state.reading_chapter_id = None
-            st.rerun()
+    st.markdown(f"### 📖 {chap['vol_name']} - {chap['title']}")
+    st.markdown(f"<div style='white-space: pre-wrap; line-height: 1.8; font-size: 17px;'>{chap['content'] or '章节内容为空'}</div>", unsafe_allow_html=True)
+    if st.button("❌ 关闭预览", key="close_read_modal"):
+        st.session_state.reading_chapter_id = None
+        st.rerun()
 
 def update_chapter_title_db(chap_id, new_title_key):
     new_title = st.session_state[new_title_key]
@@ -372,23 +474,20 @@ def resequence_volumes(db_mgr, book_id):
         db_mgr.execute("UPDATE volumes SET sort_order=? WHERE id=?", ((index + 1) * 100, vol['id']))
 
 def move_item_in_db(db_mgr, table, item_id, direction):
-    pk = 'id'
     context_key = 'book_id' if table == 'volumes' else 'volume_id'
-    item = db_mgr.query(f"SELECT * FROM {table} WHERE {pk}=?", (item_id,))
+    item = db_mgr.query(f"SELECT * FROM {table} WHERE id=?", (item_id,))
     if not item: return
     item = item[0]
     current_order = item['sort_order']
     context_id = item[context_key]
     sort_op = '<' if direction == 'up' else '>'
     sort_dir = 'DESC' if direction == 'up' else 'ASC'
-    target_item_query = f"SELECT {pk}, sort_order FROM {table} WHERE {context_key}=? AND sort_order {sort_op} ? ORDER BY sort_order {sort_dir} LIMIT 1"
+    target_item_query = f"SELECT id, sort_order FROM {table} WHERE {context_key}=? AND sort_order {sort_op} ? ORDER BY sort_order {sort_dir} LIMIT 1"
     target_item_res = db_mgr.query(target_item_query, (context_id, current_order))
     if not target_item_res: return 
     target_item = target_item_res[0]
-    target_id = target_item[pk]
-    target_order = target_item['sort_order']
-    db_mgr.execute(f"UPDATE {table} SET sort_order=? WHERE {pk}=?", (target_order, item_id))
-    db_mgr.execute(f"UPDATE {table} SET sort_order=? WHERE {pk}=?", (current_order, target_id))
+    db_mgr.execute(f"UPDATE {table} SET sort_order=? WHERE id=?", (target_item['sort_order'], item_id))
+    db_mgr.execute(f"UPDATE {table} SET sort_order=? WHERE id=?", (current_order, target_item['id']))
     if table == 'chapters': resequence_chapters(db_mgr, context_id)
     elif table == 'volumes': resequence_volumes(db_mgr, context_id)
     st.session_state.rerun_flag = True

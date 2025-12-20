@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: #000000; }
+        #video-container { width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+        video { width: 100%; height: 100%; object-fit: cover; }
+    </style>
+</head>
+<body>
+    <div id="video-container">
+        <!-- 🔥 [修改] 添加 controls 属性，让用户可以手动控制声音 -->
+        <!-- 依然保留 autoplay 和 muted 以确保视频能自动开始播放 -->
+        <video id="introVid" autoplay muted controls playsinline>
+            <source src="splash.mp4" type="video/mp4">
+            您的浏览器不支持 Video 标签。
+        </video>
+    </div>
+    <script>
+        window.addEventListener('load', () => {
+            const vid = document.getElementById('introVid');
+
+            // 当视频自然播放结束时，通知 Python
+            vid.onended = function() {
+                // 确保 pywebview API 存在
+                if (window.pywebview && window.pywebview.api) {
+                    window.pywebview.api.video_ended();
+                } else {
+                    console.log("pywebview API not found.");
+                }
+            };
+        });
+    </script>
+</body>
+</html>
