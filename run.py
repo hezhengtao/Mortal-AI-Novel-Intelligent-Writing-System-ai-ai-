@@ -8,15 +8,14 @@ import traceback
 # ==========================================
 # 0. 基础环境与日志配置
 # ==========================================
-# 将日志写到用户目录，确保有权限写入
 USER_HOME = os.path.expanduser("~")
 LOG_PATH = os.path.join(USER_HOME, "mortal_write.log")
 
 class CriticalLogger:
-    """捕获所有输出并写入日志文件，防止无控制台模式下崩溃"""
+    """捕获所有输出并写入日志文件"""
     def __init__(self):
         self.file = open(LOG_PATH, "w", encoding="utf-8", buffering=1)
-        self.terminal = sys.stdout # 记录原始 stdout (如果有)
+        self.terminal = sys.stdout 
 
     def write(self, message):
         try:
@@ -32,7 +31,6 @@ class CriticalLogger:
 
     def isatty(self): return False
 
-# 强制接管 stdout/stderr
 sys.stdout = CriticalLogger()
 sys.stderr = sys.stdout
 
@@ -56,7 +54,7 @@ except Exception as e:
     sys.exit(1)
 
 # ==========================================
-# 2. 注册 AppID (任务栏图标分组)
+# 2. 注册 AppID
 # ==========================================
 try:
     myappid = 'MortalWrite.Intelligent.System.Pro.Final' 
@@ -72,19 +70,42 @@ class RECT(Structure):
 class MONITORINFO(Structure):
     _fields_ = [("cbSize", c_long), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", c_long)]
 
+GWL_STYLE = -16
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+WS_SYSMENU     = 0x00080000 
+SWP_NOZORDER     = 0x0004
+SWP_NOACTIVATE   = 0x0010
+SWP_FRAMECHANGED = 0x0020
+MONITOR_DEFAULTTONEAREST = 0x00000002
+
 def force_window_styles():
-    """强制开启最小化/最大化按钮"""
+    """
+    使用 FindWindowW 精准查找窗口，解决竞态条件问题。
+    """
+    target_title = "凡人智能写作系统"
+    hwnd = 0
+    
+    # 尝试 20 次，每次间隔 0.25 秒
+    for _ in range(20):
+        hwnd = windll.user32.FindWindowW(None, target_title)
+        if hwnd:
+            break
+        time.sleep(0.25)
+    
+    if not hwnd:
+        print("Style Fix Warning: Could not find window handle.")
+        return
+
     try:
-        time.sleep(1.0) 
-        hwnd = windll.user32.GetForegroundWindow()
-        GWL_STYLE = -16
-        WS_MINIMIZEBOX = 0x00020000
-        WS_MAXIMIZEBOX = 0x00010000
         style = windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-        style = style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX 
+        style = style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
         windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-        windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027) 
-    except: pass
+        windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 
+                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | 0x0001 | 0x0002)
+        print(f"Style Fix Applied to HWND: {hwnd}")
+    except Exception as e:
+        print(f"Style Fix Error: {e}")
 
 # ==========================================
 # 4. 全局变量
@@ -140,8 +161,13 @@ def load_workspace_config():
         config_path = get_config_path()
         if os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f).get("workspace_path", "")
-    except: pass
+                data = json.load(f)
+                path = data.get("workspace_path", "")
+                if path and os.path.exists(path):
+                    return path
+                else:
+                    return ""
+    except Exception: pass
     return ""
 
 def find_free_port(start=8501):
@@ -158,21 +184,16 @@ def find_free_port(start=8501):
 # ==========================================
 def run_streamlit_thread():
     global STREAMLIT_PORT
-    
     main_py = find_real_path("main.py")
     if not main_py:
         print("ERROR: main.py not found")
         return
 
-    try: 
-        from streamlit.web import cli as stcli
-    except ImportError: 
-        print("ERROR: Streamlit import failed")
-        return
+    try: from streamlit.web import cli as stcli
+    except ImportError: return
     
     threading.Thread(target=_check_streamlit_ready, daemon=True).start()
     
-    # 设置环境变量防止报错
     os.environ["STREAMLIT_SERVER_PORT"] = str(STREAMLIT_PORT)
     os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
     os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none" 
@@ -188,7 +209,6 @@ def run_streamlit_thread():
         "--server.runOnSave=false",
         "--client.toolbarMode=minimal"
     ]
-    
     try: stcli.main()
     except SystemExit: pass
     except Exception as e: print(f"Streamlit Error: {e}")
@@ -210,10 +230,8 @@ def _check_streamlit_ready():
 def run_http_thread():
     global HTTP_PORT
     if not ASSETS_DIR: return
-    
     import http.server
     import socketserver
-    
     os.chdir(ASSETS_DIR)
     Handler = http.server.SimpleHTTPRequestHandler
     Handler.log_message = lambda *args, **kwargs: None
@@ -229,16 +247,14 @@ def run_http_thread():
 class Api:
     def __init__(self): 
         self._is_maximized = False
+        self._is_fullscreen = False
         self._video_ended = False
         self._app_loaded = False
         self._workspace_confirmed = False
-        self._normal_bounds = None 
+        self._restore_rect = None
 
-    def signal_video_ended(self): 
-        self._video_ended = True
-    
-    def signal_app_loaded(self): 
-        self._app_loaded = True
+    def signal_video_ended(self): self._video_ended = True
+    def signal_app_loaded(self): self._app_loaded = True
     
     def app_ready_trigger(self):
         self._app_loaded = True
@@ -247,23 +263,18 @@ class Api:
     def select_folder(self):
         try:
             if not WINDOW_INSTANCE: return None
-            # 兼容新旧版 pywebview
             dlg_type = getattr(webview, 'FOLDER_DIALOG', 2) 
             result = WINDOW_INSTANCE.create_file_dialog(dlg_type, allow_multiple=False)
             if result and len(result) > 0: return result[0]
-        except Exception as e:
-            print(f"Select Folder Error: {e}")
+        except: pass
         return None
     
     def save_workspace_config(self, path):
-        """保存工作区路径到配置文件"""
         try:
             config_path = get_config_path()
-            print(f"Saving config to: {config_path}, Path: {path}")
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump({"workspace_path": path}, f, ensure_ascii=False)
-        except Exception as e:
-            print(f"Save Config Error: {e}")
+        except: pass
 
     def enter_system(self):
         self._workspace_confirmed = True
@@ -300,15 +311,76 @@ class Api:
     def minimize(self):
         if WINDOW_INSTANCE: WINDOW_INSTANCE.minimize()
     
-    def toggle_maximize(self):
-        try:
-            if not WINDOW_INSTANCE: return
-            if self._is_maximized:
-                WINDOW_INSTANCE.restore()
-                self._is_maximized = False
+    def _save_restore_rect(self, hwnd):
+        if not self._is_maximized and not self._is_fullscreen:
+            rect = RECT()
+            windll.user32.GetWindowRect(hwnd, byref(rect))
+            self._restore_rect = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+    def _apply_window_rect(self, hwnd, mode):
+        if mode == 'restore':
+            if self._restore_rect:
+                x, y, w, h = self._restore_rect
+                windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER)
             else:
-                WINDOW_INSTANCE.maximize()
+                windll.user32.SetWindowPos(hwnd, 0, 100, 100, 1280, 800, SWP_NOZORDER)
+            return
+
+        monitor = windll.user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        mi = MONITORINFO()
+        mi.cbSize = sizeof(MONITORINFO)
+        windll.user32.GetMonitorInfoW(monitor, byref(mi))
+
+        if mode == 'max':
+            target_rect = mi.rcWork
+        else:
+            target_rect = mi.rcMonitor
+
+        w_left = target_rect.left
+        w_top = target_rect.top
+        w_width = target_rect.right - target_rect.left
+        w_height = target_rect.bottom - target_rect.top
+        windll.user32.SetWindowPos(hwnd, 0, w_left, w_top, w_width, w_height, SWP_NOZORDER)
+
+    def toggle_maximize(self):
+        """最大化/还原切换，并通知前端更新图标"""
+        try:
+            hwnd = windll.user32.FindWindowW(None, "凡人智能写作系统")
+            if not hwnd: return
+
+            if self._is_maximized:
+                # 还原
+                self._apply_window_rect(hwnd, 'restore')
+                self._is_maximized = False
+                # 通知前端：改为单方框图标 (false = 不处于最大化)
+                if WINDOW_INSTANCE: WINDOW_INSTANCE.evaluate_js("updateMaximizeIcon(false)")
+            else:
+                # 最大化
+                self._save_restore_rect(hwnd)
+                self._apply_window_rect(hwnd, 'max')
                 self._is_maximized = True
+                self._is_fullscreen = False 
+                # 通知前端：改为双方框图标 (true = 处于最大化)
+                if WINDOW_INSTANCE: WINDOW_INSTANCE.evaluate_js("updateMaximizeIcon(true)")
+        except Exception as e:
+            if WINDOW_INSTANCE: WINDOW_INSTANCE.maximize()
+
+    def toggle_fullscreen(self):
+        try:
+            hwnd = windll.user32.FindWindowW(None, "凡人智能写作系统")
+            if not hwnd: return
+
+            if self._is_fullscreen:
+                self._apply_window_rect(hwnd, 'restore')
+                self._is_fullscreen = False
+            else:
+                self._save_restore_rect(hwnd)
+                self._apply_window_rect(hwnd, 'full')
+                self._is_fullscreen = True
+                self._is_maximized = False
+            
+            # 全屏切换时，将最大化按钮重置为“最大化”样式（单方框）
+            if WINDOW_INSTANCE: WINDOW_INSTANCE.evaluate_js("updateMaximizeIcon(false)")
         except: pass
     
     def close(self):
@@ -360,11 +432,9 @@ if __name__ == '__main__':
         HTTP_PORT = find_free_port(8000)
         STREAMLIT_PORT = find_free_port(8501) 
         
-        # 获取上次保存的路径
         last_path = load_workspace_config()
         print(f"Loaded Last Workspace: {last_path}")
 
-        # HTML 内容
         html_content = f"""
         <!DOCTYPE html><html lang="zh-CN">
         <head>
@@ -391,13 +461,14 @@ if __name__ == '__main__':
                 #loading-overlay {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9998; background-color: #000000; display: none; flex-direction: column; justify-content: center; align-items: center; opacity: 0; transition: opacity 0.5s ease; }}
                 .spinner {{ width: 50px; height: 50px; border: 4px solid #333; border-top: 4px solid #fff; border-radius: 50%; animation: spin 1s linear infinite; margin-bottom: 20px; }}
                 .loading-text {{ font-family: sans-serif; color: #aaa; font-size: 1.0em; letter-spacing: 1px; }}
-                @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+                
                 #parent-controls {{ position: fixed; top: 0; left: 0; width: 100%; height: 32px; z-index: 99999; opacity: 1; background-color: #f9f9f9; display: flex; justify-content: space-between; align-items: center; pointer-events: none; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }}
                 .titlebar-title {{ padding-left: 12px; font-family: sans-serif; font-size: 14px; color: #333; -webkit-app-region: drag; pointer-events: auto; flex-grow: 1; }}
                 .titlebar-buttons {{ pointer-events: auto; display: flex; flex-shrink: 0; }} 
-                .titlebar-button {{ display: flex; justify-content: center; align-items: center; width: 46px; height: 32px; cursor: pointer; transition: background-color 0.2s; }}
+                .titlebar-button {{ display: flex; justify-content: center; align-items: center; width: 46px; height: 32px; cursor: pointer; transition: background-color 0.2s; position: relative; }}
                 .titlebar-button:hover {{ background-color: #e5e5e5; }} 
                 #close-btn:hover {{ background-color: #e81123; }} #close-btn:hover svg path {{ stroke: #fff; }}
+                
                 #app-container {{ position: absolute; top: 32px; left: 0; width: 100%; height: calc(100% - 32px); background-color: #000000; z-index: 1; opacity: 0; }}
             </style>
             <script>
@@ -405,37 +476,42 @@ if __name__ == '__main__':
                     const params = new URLSearchParams(window.location.search);
                     const pathFromUrl = params.get('workspace');
                     const displayBox = document.getElementById('selected-path-text');
-                    
-                    if (pathFromUrl && pathFromUrl.length > 1) {{ 
+                    if (pathFromUrl && pathFromUrl.length > 1 && pathFromUrl !== "null" && pathFromUrl !== "undefined") {{ 
                         displayBox.innerText = pathFromUrl; 
                         handleEnterSystem(); 
                     }} else {{ 
-                        // 如果没有历史路径，显示提示语
-                        if (displayBox.innerText === '') displayBox.innerText = '请选择目录'; 
+                        if (displayBox.innerText === '' || displayBox.innerText === 'null') displayBox.innerText = '请选择目录'; 
                         showWorkspaceSelector();
                     }}
                 }}
                 function showWorkspaceSelector() {{ document.getElementById('workspace-modal').style.opacity = "1"; document.getElementById('workspace-modal').style.pointerEvents = "auto"; }}
                 function handleSelectFolder() {{ pywebview.api.select_folder().then(function(path) {{ if (path) document.getElementById('selected-path-text').innerText = path; }}); }}
-                
                 function handleEnterSystem() {{ 
                     const path = document.getElementById('selected-path-text').innerText;
+                    if (!path || path === '请选择目录' || path.length < 2) {{ alert("请先选择一个有效的创作空间目录"); return; }}
                     let targetSrc = 'http://localhost:{STREAMLIT_PORT}/';
-                    
-                    // [关键修复] 当用户点击进入时，如果路径有效，立即保存到配置文件
-                    if (path && path !== '请选择目录') {{ 
-                        pywebview.api.save_workspace_config(path); // <--- 调用 Python 保存
-                        targetSrc = 'http://localhost:{STREAMLIT_PORT}/?workspace=' + encodeURIComponent(path); 
-                    }}
-                    
+                    pywebview.api.save_workspace_config(path); 
+                    targetSrc = 'http://localhost:{STREAMLIT_PORT}/?workspace=' + encodeURIComponent(path); 
                     document.getElementById('loading-overlay').style.display = 'flex';
                     document.getElementById('loading-overlay').style.opacity = '1';
                     document.getElementById('app-frame').src = targetSrc;
                     pywebview.api.enter_system(); 
                 }}
-                
                 function onAppFrameLoad() {{ setTimeout(function() {{ pywebview.api.app_ready_trigger(); }}, 1500); }}
                 function onVideoEnded() {{ pywebview.api.signal_video_ended(); checkUrlAndShowWorkspace(); }}
+                
+                // --- 图标更新逻辑 ---
+                function updateMaximizeIcon(isMaximized) {{
+                    const btnSvg = document.getElementById('max-restore-svg');
+                    if (!btnSvg) return;
+                    if (isMaximized) {{
+                        // 显示还原图标 (重叠矩形)
+                        btnSvg.innerHTML = '<path d="M2.5,2.5 L2.5,9.5 L9.5,9.5 L9.5,2.5 Z M2.5,2.5 L2.5,0.5 L9.5,0.5 L9.5,2.5" fill="none" stroke="transparent" /><path d="M2.1,2.1 h7.8 v7.8 h-7.8 v-7.8 Z M2.1,2.1 v-2 h9 v9 h-2" stroke="#333" fill="none" />';
+                    }} else {{
+                        // 显示最大化图标 (单矩形)
+                        btnSvg.innerHTML = '<rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="#333" stroke-width="1"></rect>';
+                    }}
+                }}
             </script>
         </head>
         <body>
@@ -450,13 +526,29 @@ if __name__ == '__main__':
             </div>
             <div id="loading-overlay"><div class="spinner"></div><div class="loading-text">正在初始化系统...</div></div>
             <div id="app-container"><iframe id="app-frame" sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-downloads allow-modals" style="width:100%;height:100%;border:none;background-color:#000;" onload="onAppFrameLoad()"></iframe></div>
+            
             <div id="parent-controls">
                 <div class="titlebar-title">凡人智能写作系统</div>
                 <div class="titlebar-buttons">
-                    <div class="titlebar-button" onclick="pywebview.api.change_workspace()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg></div>
-                    <div class="titlebar-button" onclick="pywebview.api.minimize()"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0,5 L10,5" stroke="#333" stroke-width="1"></path></svg></div>
-                    <div class="titlebar-button" id="toggle-maximize-btn" onclick="pywebview.api.toggle_maximize()"><svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="#333" stroke-width="1"></rect></svg></div>
-                    <div class="titlebar-button" id="close-btn" onclick="pywebview.api.close()"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0,0 L10,10 M10,0 L0,10" stroke="#333" stroke-width="1.5"></path></svg></div>
+                    <div class="titlebar-button" title="全屏模式" onclick="pywebview.api.toggle_fullscreen()">
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#333" stroke-width="1.5"><path d="M2 5V2h3M14 5V2h-3M2 11v3h3M14 11v3h-3"></path></svg>
+                    </div>
+                    <div class="titlebar-button" title="切换工作区" onclick="pywebview.api.change_workspace()">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#333" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                    </div>
+                    <div class="titlebar-button" title="最小化" onclick="pywebview.api.minimize()">
+                        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0,5 L10,5" stroke="#333" stroke-width="1"></path></svg>
+                    </div>
+                    
+                    <div class="titlebar-button" title="最大化/还原" onclick="pywebview.api.toggle_maximize()">
+                        <svg id="max-restore-svg" width="10" height="10" viewBox="0 0 10 10">
+                            <rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="#333" stroke-width="1"></rect>
+                        </svg>
+                    </div>
+                    
+                    <div class="titlebar-button" id="close-btn" title="关闭" onclick="pywebview.api.close()">
+                        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M0,0 L10,10 M10,0 L0,10" stroke="#333" stroke-width="1.5"></path></svg>
+                    </div>
                 </div>
             </div>
         </body></html>
