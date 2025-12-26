@@ -10,17 +10,90 @@ import random
 import base64
 import html
 import re
+import csv
+import uuid
+import threading
+from datetime import datetime
 
 from database import save_avatar_file
 from config import FEATURE_MODELS
 from logic import MODEL_MAPPING, OpenAI 
-from utils import log_operation
 
 # 🔥 导入 DATA_DIR 以解决路径问题
 try:
     from config import DATA_DIR
 except ImportError:
     DATA_DIR = "data"
+
+# ==============================================================================
+# 🛡️ 核心修复：严格审计日志系统 (Strict Audit Logging)
+# ==============================================================================
+
+SYSTEM_LOG_PATH = os.path.join(DATA_DIR, "logs", "system_audit.csv")
+_log_lock = threading.Lock() # 线程锁，防止并发写入冲突
+
+def get_session_id():
+    """获取或生成当前会话的唯一追踪ID"""
+    if "session_trace_id" not in st.session_state:
+        st.session_state.session_trace_id = str(uuid.uuid4())[:8]
+    return st.session_state.session_trace_id
+
+def log_audit_event(category, action, details, status="SUCCESS", module="角色管理"):
+    """
+    执行严格的审计日志写入
+    :param category: 操作类别 (e.g., "角色管理", "关系管理")
+    :param action: 具体动作 (e.g., "添加角色", "更新头像")
+    :param details: 详细内容 (支持 Dict/List 自动转 JSON 字符串)
+    :param status: 操作状态 (SUCCESS / WARNING / ERROR)
+    :param module: 所属模块
+    """
+    try:
+        os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_id = get_session_id()
+        
+        # 汉化状态码
+        status_map = {
+            "SUCCESS": "成功",
+            "WARNING": "警告",
+            "ERROR": "错误"
+        }
+        status_cn = status_map.get(status, status)
+        
+        # 汉化模块名
+        module_map = {
+            "SETTINGS": "系统设置",
+            "WRITER": "写作终端",
+            "DASHBOARD": "数据看板",
+            "角色管理": "角色管理",
+            "书籍管理": "书籍管理",
+            "章节管理": "章节管理"
+        }
+        module_cn = module_map.get(module, module)
+
+        # 序列化复杂对象
+        if isinstance(details, (dict, list)):
+            try: details = json.dumps(details, ensure_ascii=False)
+            except: details = str(details)
+            
+        row = [timestamp, session_id, module_cn, category, action, status_cn, details]
+        
+        # 使用线程锁确保原子写入
+        with _log_lock:
+            file_exists = os.path.exists(SYSTEM_LOG_PATH)
+            with open(SYSTEM_LOG_PATH, mode='a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                # 🔥 汉化表头
+                if not file_exists or os.path.getsize(SYSTEM_LOG_PATH) == 0:
+                    writer.writerow(['时间', '会话ID', '模块', '类别', '操作', '状态', '详情']) 
+                writer.writerow(row)
+    except Exception as e:
+        print(f"❌ 审计日志写入失败: {e}")
+
+# 兼容旧接口，重定向到新审计系统
+def log_operation(category, action):
+    """兼容旧日志接口，转发到审计系统"""
+    log_audit_event(category, action, "", module="角色管理")
 
 # --- 0. 基础配置 ---
 THEME_COLOR = "#2e7d32" 
@@ -104,7 +177,10 @@ def custom_option_dialog(list_key, widget_key):
             if new_val not in st.session_state[list_key]:
                 st.session_state[list_key].append(new_val)
             st.session_state[widget_key] = new_val
-            log_operation('角色', f'添加自定义选项 {new_val} 到 {list_key}')
+            log_audit_event("选项管理", "添加自定义选项", {
+                "列表类型": list_key,
+                "选项名称": new_val
+            })
             st.rerun()
         else: st.warning("内容不能为空")
 
@@ -148,7 +224,12 @@ def edit_avatar_dialog(char_id, current_avatar, char_name, current_book_id):
         if final_path != current_avatar:
             st.session_state.db.execute("UPDATE characters SET avatar=? WHERE id=?", (final_path, char_id))
             update_book_timestamp_by_book_id(current_book_id)
-            log_operation('角色', f'更新头像：{char_name} (ID: {char_id})')
+            log_audit_event("头像管理", "更新角色头像", {
+                "角色ID": char_id,
+                "角色名称": char_name,
+                "书籍ID": current_book_id,
+                "头像路径": final_path[:100] + "..." if len(final_path) > 100 else final_path
+            })
             st.toast("✅ 头像已更新！")
             time.sleep(0.5)
             st.rerun()
@@ -314,21 +395,88 @@ def repair_json_content(content):
     return content.strip()
 
 def ai_extract_characters(engine, db_mgr, current_book, current_book_id, progress_callback=None):
-    log_operation('角色', f'启动 AI 角色提取任务: {current_book["title"]}')
+    log_audit_event("AI提取", "启动角色提取", {
+        "书籍名称": current_book["title"],
+        "书籍ID": current_book_id,
+        "操作类型": "AI角色提取"
+    })
+    
     feature_key = "character_extract"
     assigned_model_key = engine.get_config_db("model_assignments", {}).get(feature_key, FEATURE_MODELS[feature_key]['default'])
-    client, model_name, _ = engine.get_client(assigned_model_key)
+    
+    # 🔥 拦截自定义模型
+    if assigned_model_key and str(assigned_model_key).startswith("CUSTOM::"):
+        try:
+            # 提取真实名称
+            target_name = assigned_model_key.split("::", 1)[1]
+            
+            # 从数据库读取配置
+            settings = engine.get_config_db("ai_settings", {})
+            custom_list = settings.get("custom_model_list", [])
+            
+            # 查找匹配项
+            for m in custom_list:
+                if m.get("name") == target_name:
+                    api_key = m.get("key")
+                    base_url = m.get("base")
+                    model_id = m.get("api_model")
+                    
+                    if not api_key or not base_url:
+                        log_audit_event("AI提取", "角色提取失败", {
+                            "原因": "自定义模型配置不完整",
+                            "模型名称": target_name,
+                            "书籍": current_book["title"]
+                        }, status="ERROR")
+                        return False, f"❌ 自定义模型 {target_name} 配置不完整。请检查 API Key 和 Base URL。"
+                        
+                    # 实例化 OpenAI (使用 logic 中导入的类)
+                    client = OpenAI(api_key=api_key, base_url=base_url)
+                    model_name = model_id
+                    model_key = assigned_model_key
+                    
+                    # 获取显示名称
+                    display_model_name = target_name
+                    break
+            else:
+                log_audit_event("AI提取", "角色提取失败", {
+                    "原因": "未找到自定义模型配置",
+                    "模型名称": target_name,
+                    "书籍": current_book["title"]
+                }, status="ERROR")
+                return False, f"❌ 未找到自定义模型配置: {target_name}"
+        except Exception as e:
+            print(f"❌ 自定义模型解析失败: {e}")
+            log_audit_event("AI提取", "角色提取失败", {
+                "原因": "自定义模型解析异常",
+                "异常信息": str(e),
+                "书籍": current_book["title"]
+            }, status="ERROR")
+            return False, f"❌ 自定义模型解析失败: {str(e)}"
+    else:
+        # 2. 原生模型走默认逻辑
+        client, model_name, model_key = engine.get_client(assigned_model_key)
+        display_model_name = MODEL_MAPPING.get(assigned_model_key, {}).get('name', model_name)
+    
     feat_name = FEATURE_MODELS[feature_key]['name']
-    display_model_name = MODEL_MAPPING.get(assigned_model_key, {}).get('name', model_name)
     
     if not client: 
-        log_operation('角色', '提取失败：未配置 AI 模型')
+        log_audit_event("AI提取", "角色提取失败", {
+            "原因": "AI模型未配置",
+            "功能": feat_name,
+            "书籍": current_book["title"]
+        }, status="ERROR")
         return False, f"❌ AI 模型未配置。请在【系统设置】->【功能调度】中为 [{feat_name}] 选择模型并保存。"
 
     if progress_callback: 
         progress_callback(10, "STEP 1/6: 正在扫描现有角色库...")
+    
+    # 🔥 加强版去重算法：获取所有已有角色，包括空格处理
     existing_res = db_mgr.query("SELECT name FROM characters WHERE book_id=?", (current_book_id,))
-    existing_names = {r['name'] for r in existing_res} if existing_res else set()
+    existing_names = set()
+    for r in existing_res:
+        # 去除空格并进行小写处理，实现更严格去重
+        cleaned_name = r['name'].strip().lower()
+        existing_names.add(cleaned_name)
 
     if progress_callback: 
         progress_callback(20, "STEP 2/6: 正在读取小说内容...")
@@ -340,34 +488,34 @@ def ai_extract_characters(engine, db_mgr, current_book, current_book_id, progres
         progress_callback(40, f"STEP 3/6: 正在调用 {display_model_name} 深度分析 (这可能需要十几秒)...")
     
     prompt = f"""
-    请深入分析小说《{current_book['title']}》。
-    {f"参考小说前文片段：{content_snippet[:3500]}..." if content_snippet else "请基于你的知识库。"}
-    
-    任务：提取该小说中最重要的 5-10 个角色，并补充详细的网文设定属性。
-    
-    要求：
-    1. 必须返回纯粹的 JSON 数组格式。
-    2. 不要包含 markdown 标记。
-    3. 严禁使用尾随逗号（trailing commas）。
-    4. 排除已存在的角色：{list(existing_names)}
-    
-    返回 JSON 结构示例：
-    [
-        {{
-            "name": "角色名", "gender": "男/女", "race": "种族", "role": "主角/反派...",
-            "desc": "基础外貌和性格描述",
-            "is_major": true,
-            "origin": "家族弃子",
-            "profession": "炼药师",
-            "cheat_ability": "骨灵冷火",
-            "power_level": "斗之气三段",
-            "relationships": [
-                 {{"target": "另一个角色名", "label": "义父"}},
-                 {{"target": "另一个角色名", "label": "宿敌"}}
-            ]
-        }}
-    ]
-    """
+请深入分析小说《{current_book['title']}》。
+{f"参考小说前文片段：{content_snippet[:3500]}..." if content_snippet else "请基于你的知识库。"}
+
+任务：提取该小说中最重要的 5-10 个角色，并补充详细的网文设定属性。
+
+要求：
+1. 必须返回纯粹的 JSON 数组格式。
+2. 不要包含 markdown 标记。
+3. 严禁使用尾随逗号（trailing commas）。
+4. 排除已存在的角色：{list(existing_names)}
+
+返回 JSON 结构示例：
+[
+    {{
+        "name": "角色名", "gender": "男/女", "race": "种族", "role": "主角/反派...",
+        "desc": "基础外貌和性格描述",
+        "is_major": true,
+        "origin": "家族弃子",
+        "profession": "炼药师",
+        "cheat_ability": "骨灵冷火",
+        "power_level": "斗之气三段",
+        "relationships": [
+            {{"target": "另一个角色名", "label": "义父"}},
+            {{"target": "另一个角色名", "label": "宿敌"}}
+        ]
+    }}
+]
+"""
     
     try:
         response = client.chat.completions.create(
@@ -386,14 +534,39 @@ def ai_extract_characters(engine, db_mgr, current_book, current_book_id, progres
             char_list = json.loads(cleaned_json)
         except json.JSONDecodeError as e:
             print(f"JSON Parse Error: {e} | Content: {raw_content}")
+            log_audit_event("AI提取", "角色提取失败", {
+                "原因": "AI返回格式有误",
+                "异常信息": str(e),
+                "模型": display_model_name,
+                "书籍": current_book["title"]
+            }, status="ERROR")
             return False, f"AI 返回格式有误，自动修复失败。请重试。(Error: {e})"
 
         final_list = []
         total_items = len(char_list)
         
+        # 🔥 双重去重算法：1. 与已有角色去重 2. 本次提取内部去重
+        seen_names_in_extraction = set()
+        
         for i, c in enumerate(char_list):
             if not c.get('name'): 
                 continue
+            
+            # 🔥 标准化角色名进行去重检查
+            raw_name = c['name'].strip()
+            cleaned_name = raw_name.lower()
+            
+            # 检查是否在已有角色中
+            if cleaned_name in existing_names:
+                print(f"跳过重复角色（已有）: {raw_name}")
+                continue
+            
+            # 检查是否在本次提取中已经出现过
+            if cleaned_name in seen_names_in_extraction:
+                print(f"跳过重复角色（本次提取）: {raw_name}")
+                continue
+            
+            seen_names_in_extraction.add(cleaned_name)
             
             # 动态更新进度
             current_progress = 70 + int((i / total_items) * 25)
@@ -410,21 +583,33 @@ def ai_extract_characters(engine, db_mgr, current_book, current_book_id, progres
         
         if progress_callback: 
             progress_callback(100, "✅ 分析完成！")
-        log_operation('角色', f'提取成功：AI 发现了 {len(final_list)} 个角色。')
+        
+        log_audit_event("AI提取", "角色提取成功", {
+            "模型": display_model_name,
+            "书籍": current_book["title"],
+            "提取数量": len(final_list),
+            "过滤数量": len(char_list) - len(final_list)
+        })
+        
         return True, final_list
         
     except Exception as e:
-        log_operation('角色', f'提取异常：{str(e)}')
+        log_audit_event("AI提取", "角色提取异常", {
+            "模型": display_model_name,
+            "书籍": current_book["title"],
+            "异常信息": str(e)
+        }, status="ERROR")
         return False, f"提取失败: {str(e)}"
 
 # --------------------------------------------------------------------------
 # 🔥 修复版：核心渲染逻辑
 # --------------------------------------------------------------------------
 
-def generate_graph_html(nodes, edges, height="600px"):
+def generate_graph_html(nodes, edges, height="600px", stats=None):
     
     nodes_json = json.dumps(nodes)
     edges_json = json.dumps(edges)
+    stats_json = json.dumps(stats) if stats else '{"char_count":0,"relation_count":0}'
     
     # 使用 CDN 链接
     vis_js_url = "https://lib.baomitu.com/vis/4.21.0/vis.min.js"
@@ -466,10 +651,38 @@ def generate_graph_html(nodes, edges, height="600px"):
             }}
             div.vis-tooltip strong {{ color: #2e7d32; font-size: 15px; display: block; margin-bottom: 4px; }}
             div.vis-tooltip span.meta {{ color: #888; font-size: 12px; display: block; margin-bottom: 8px; border-bottom: 1px dashed #eee; padding-bottom: 4px; }}
+            
+            /* 统计信息样式 */
+            .graph-stats {{
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(255, 255, 255, 0.9);
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-family: "Microsoft YaHei", sans-serif;
+                font-size: 12px;
+                z-index: 1000;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }}
+            .stat-item {{
+                display: flex;
+                justify-content: space-between;
+                margin: 4px 0;
+            }}
+            .stat-label {{
+                color: #666;
+            }}
+            .stat-value {{
+                font-weight: bold;
+                color: #2e7d32;
+            }}
         </style>
     </head>
     <body>
     <div id="mynetwork"></div>
+    <div id="stats" class="graph-stats"></div>
     <script type="text/javascript">
         var nodes = new vis.DataSet({nodes_json});
         var edges = new vis.DataSet({edges_json});
@@ -518,15 +731,15 @@ def generate_graph_html(nodes, edges, height="600px"):
             physics: {{
                 enabled: true,
                 forceAtlas2Based: {{ 
-                    gravitationalConstant: -100, 
-                    centralGravity: 0.015, 
-                    springLength: 120, 
-                    springConstant: 0.08, 
-                    damping: 0.4, 
-                    avoidOverlap: 0.8 
+                    gravitationalConstant: -200,  // 🔥 增加负值，增加节点间的排斥力
+                    centralGravity: 0.01,        // 🔥 减小中心引力
+                    springLength: 250,           // 🔥 增加弹簧长度，让节点远一点
+                    springConstant: 0.05,        // 🔥 减小弹簧常数
+                    damping: 0.6,                // 🔥 增加阻尼
+                    avoidOverlap: 1.0            // 🔥 避免重叠
                 }},
                 maxVelocity: 50, 
-                minVelocity: 0.1, 
+                minVelocity: 0.1,
                 solver: 'forceAtlas2Based'
             }},
             manipulation: {{ enabled: false }},
@@ -541,6 +754,20 @@ def generate_graph_html(nodes, edges, height="600px"):
         }};
         
         var network = new vis.Network(container, data, options);
+        
+        // 🔥 显示统计信息
+        var stats = {stats_json};
+        var statsDiv = document.getElementById('stats');
+        statsDiv.innerHTML = `
+            <div class="stat-item">
+                <span class="stat-label">👥 人物:</span>
+                <span class="stat-value">${{stats.char_count}}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">🔗 关系:</span>
+                <span class="stat-value">${{stats.relation_count}}</span>
+            </div>
+        `;
         
         // 延迟调整视图，确保图片加载完成
         setTimeout(function() {{ 
@@ -589,7 +816,7 @@ def render_characters(engine, current_book_arg=None):
     
     render_header("👥", "角色档案")
     
-    # CSS 样式优化
+    # CSS 样式优化 - 包含修复右侧列表管理滑块位置的样式
     st.markdown(f"""
     <style>
     input[type="checkbox"] {{ accent-color: {THEME_COLOR} !important; }}
@@ -644,6 +871,204 @@ def render_characters(engine, current_book_arg=None):
     
     .name-input-container input {{
         margin-top: 0 !important;
+    }}
+    
+    /* 🔥 隐藏页面横线 */
+    hr {{
+        display: none !important;
+    }}
+    
+    .stDivider {{
+        display: none !important;
+    }}
+    
+    [data-testid="stHorizontalBlock"] + hr {{
+        display: none !important;
+    }}
+    
+    /* 🔥 列表管理头像大图样式 */
+    .avatar-preview {{
+        cursor: pointer;
+        transition: transform 0.2s;
+    }}
+    .avatar-preview:hover {{
+        transform: scale(1.05);
+    }}
+    .avatar-modal {{
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-color: rgba(0, 0, 0, 0.8);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+    }}
+    .avatar-modal img {{
+        max-width: 90%;
+        max-height: 90%;
+        border-radius: 12px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }}
+    .avatar-modal-close {{
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        color: white;
+        font-size: 30px;
+        cursor: pointer;
+        z-index: 10000;
+    }}
+    
+    /* 🔥 列表管理头像形状切换动效 */
+    .avatar-shape-toggle {{
+        transition: all 0.3s ease-in-out !important;
+    }}
+    .avatar-shape-toggle label {{
+        transition: all 0.3s ease-in-out !important;
+    }}
+    .avatar-shape-toggle .stRadio > div {{
+        transition: all 0.3s ease-in-out !important;
+    }}
+    
+    /* 🔥 图谱头像大小调节滑块样式 */
+    .graph-avatar-slider {{
+        margin-top: 5px !important;
+    }}
+    .graph-avatar-slider .stSlider {{
+        margin-bottom: 0 !important;
+    }}
+    .graph-avatar-slider .stSlider > div {{
+        padding-top: 0 !important;
+    }}
+    .graph-avatar-slider .stSlider label {{
+        font-size: 12px !important;
+        color: #666 !important;
+    }}
+    
+    /* 🔥 列表管理头像大小滑块样式 */
+    .list-avatar-slider {{
+        margin-top: 0 !important;  /* 移除顶部间距 */
+        margin-bottom: 0 !important;  /* 移除底部间距 */
+        padding: 0 !important;  /* 移除内边距 */
+    }}
+    .list-avatar-slider .stSlider {{
+        margin-bottom: 0 !important;
+    }}
+    .list-avatar-slider .stSlider > div {{
+        padding-top: 0 !important;
+    }}
+    .list-avatar-slider .stSlider label {{
+        font-size: 12px !important;
+        color: #666 !important;
+        margin-bottom: 0 !important;  /* 移除标签底部间距 */
+    }}
+    
+    /* 🔥 修复右侧列表管理滑块位置，与左侧对齐 */
+    .list-management-header {{
+        margin-bottom: 0 !important;
+        padding-bottom: 0 !important;
+    }}
+
+    .list-management-header p {{
+        margin: 0 0 2px 0 !important;  /* 减小段落间距 */
+        line-height: 1.2 !important;  /* 减小行高 */
+        font-size: 14px !important;
+    }}
+    
+    /* 🔥 调整滑块容器，使其更靠近上方 */
+    .list-management-slider-container {{
+        margin-top: -5px !important;  /* 向上移动5px，与左侧对齐 */
+        margin-bottom: 0 !important;
+        padding: 0 !important;
+        height: 30px !important;
+        display: flex !important;
+        align-items: center !important;
+    }}
+    
+    /* 🔥 调整形状切换容器，使其更靠近上方并与滑块对齐 */
+    .list-management-shape-container {{
+        margin-top: -5px !important;  /* 向上移动5px，与左侧对齐 */
+        margin-bottom: 0 !important;
+        padding: 0 !important;
+        height: 30px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+    }}
+    
+    /* 🔥 优化两列布局的垂直对齐 */
+    .stHorizontalBlock > div[data-testid="column"] {{
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: flex-start !important;
+        align-items: center !important;
+    }}
+    
+    /* 🔥 确保滑块和形状切换在同一水平线 */
+    .list-management-slider-container .stSlider > div,
+    .list-management-shape-container .stRadio > div {{
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }}
+    
+    /* 🔥 调整滑块标签位置 */
+    .list-management-slider-container .stSlider label {{
+        margin-bottom: 0 !important;
+        line-height: 1 !important;
+    }}
+    
+    /* 🔥 调整形状切换的垂直位置 */
+    .list-management-shape-container .stRadio > div > label {{
+        display: flex !important;
+        align-items: center !important;
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }}
+    
+    /* 🔥 调整滑块长度 */
+    .list-management-slider-container .stSlider {{
+        width: 100% !important;
+        margin-bottom: 0 !important;
+    }}
+    
+    .list-management-slider-container .stSlider > div {{
+        padding-top: 0 !important;
+        width: 100% !important;
+    }}
+    
+    .list-management-slider-container .stSlider > div > div[data-baseweb="slider"] {{
+        width: 80% !important;  /* 缩短滑动条长度 */
+        margin: 0 auto !important;  /* 居中显示 */
+    }}
+    
+    /* 🔥 调整形状切换样式 */
+    .list-management-shape-container .stRadio {{
+        margin-bottom: 0 !important;
+        margin-top: 0 !important;
+        padding: 0 !important;
+    }}
+    
+    .list-management-shape-container .stRadio > div {{
+        flex-direction: row !important;
+        justify-content: space-around !important;
+        padding: 0 !important;
+        gap: 5px !important;  /* 减小选项间距 */
+    }}
+    
+    .list-management-shape-container .stRadio > div > label {{
+        margin-right: 2px !important;  /* 减小选项间距 */
+        margin-left: 2px !important;
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+        padding: 2px 6px !important;  /* 减小内边距 */
+        font-size: 12px !important;
     }}
     </style>
     """, unsafe_allow_html=True)
@@ -714,7 +1139,9 @@ def render_characters(engine, current_book_arg=None):
             saved_relations = load_relations_from_disk(current_book_id)
             has_cache = saved_relations is not None and len(saved_relations) > 0
             
-            c_tools_1, c_tools_2 = st.columns([1, 1])
+            # 🔥 修改：添加图谱头像大小调节滑块，保持同一行中心点对齐
+            c_tools_1, c_tools_2, c_tools_3 = st.columns([1.5, 1.5, 2])
+            
             with c_tools_1:
                 btn_label = "🔄 重新生成图谱" if has_cache else "🤖 AI 生成图谱"
                 if st.button(btn_label, key="gen_chart_btn", type="primary", width="stretch"):
@@ -723,27 +1150,122 @@ def render_characters(engine, current_book_arg=None):
                     if not assigned_key: assigned_key = assignments.get("novel_structure_gen")
                     if not assigned_key: assigned_key = "GPT_4o"
 
-                    client, model_name, model_key = engine.get_client(assigned_key)
+                    # 🔥 拦截自定义模型
+                    if assigned_key and str(assigned_key).startswith("CUSTOM::"):
+                        try:
+                            target_name = assigned_key.split("::", 1)[1]
+                            settings = engine.get_config_db("ai_settings", {})
+                            custom_list = settings.get("custom_model_list", [])
+                            
+                            for m in custom_list:
+                                if m.get("name") == target_name:
+                                    api_key = m.get("key")
+                                    base_url = m.get("base")
+                                    model_id = m.get("api_model")
+                                    
+                                    if not api_key or not base_url:
+                                        st.error(f"自定义模型 {target_name} 配置不完整")
+                                        break
+                                    
+                                    client = OpenAI(api_key=api_key, base_url=base_url)
+                                    model_name = model_id
+                                    model_key = assigned_key
+                                    break
+                            else:
+                                st.error(f"未找到自定义模型配置: {target_name}")
+                                client = None
+                                model_name = None
+                                model_key = None
+                        except Exception as e:
+                            st.error(f"自定义模型解析失败: {e}")
+                            client = None
+                            model_name = None
+                            model_key = None
+                    else:
+                        client, model_name, model_key = engine.get_client(assigned_key)
                     
                     if not client: 
                         st.error(f"请先配置图谱生成模型")
                     else:
-                        log_operation('角色', f'开始生成关系图谱: {current_book["title"]}')
+                        log_audit_event("关系图谱", "开始生成关系图谱", {
+                            "书籍名称": current_book["title"],
+                            "书籍ID": current_book_id,
+                            "模型": model_name if model_name else "未知"
+                        })
+                        
                         with st.spinner("AI 正在阅读分析人物关系..."):
-                            ok, res = engine.generate_char_relation_map_pyvis(current_book_id, chars_graph, client, model_name, model_key)
-                            if ok and isinstance(res, list):
-                                save_relations_to_disk(current_book_id, res)
-                                saved_relations = res
-                                log_operation('角色', f'图谱生成成功并保存 ({len(res)} 条关系)。')
-                                st.rerun()
-                            else:
-                                st.error(f"生成失败: {res}")
+                            try:
+                                ok, res = engine.generate_char_relation_map_pyvis(current_book_id, chars_graph, client, model_name, model_key)
+                                if ok and isinstance(res, list):
+                                    save_relations_to_disk(current_book_id, res)
+                                    saved_relations = res
+                                    log_audit_event("关系图谱", "图谱生成成功", {
+                                        "书籍名称": current_book["title"],
+                                        "书籍ID": current_book_id,
+                                        "关系数量": len(res),
+                                        "模型": model_name if model_name else "未知"
+                                    })
+                                    st.rerun()
+                                else:
+                                    # 🔥 修复 JSON 解析错误提示
+                                    if isinstance(res, str) and "Expecting value: line 1 column 1" in res:
+                                        log_audit_event("关系图谱", "图谱生成失败", {
+                                            "原因": "AI返回数据格式有误",
+                                            "书籍": current_book["title"],
+                                            "模型": model_name if model_name else "未知"
+                                        }, status="ERROR")
+                                        st.error("图谱生成失败：AI 返回的数据格式有误，请检查模型是否支持关系分析功能，或尝试使用其他模型。")
+                                    else:
+                                        log_audit_event("关系图谱", "图谱生成失败", {
+                                            "原因": res if isinstance(res, str) else "未知错误",
+                                            "书籍": current_book["title"],
+                                            "模型": model_name if model_name else "未知"
+                                        }, status="ERROR")
+                                        st.error(f"生成失败: {res}")
+                            except json.JSONDecodeError as e:
+                                log_audit_event("关系图谱", "图谱生成失败", {
+                                    "原因": "JSON解析错误",
+                                    "异常信息": str(e),
+                                    "书籍": current_book["title"],
+                                    "模型": model_name if model_name else "未知"
+                                }, status="ERROR")
+                                st.error(f"图谱生成失败：AI 返回的数据格式有误，JSON 解析错误: {str(e)}。请检查模型是否支持关系分析功能。")
+                            except Exception as e:
+                                log_audit_event("关系图谱", "图谱生成失败", {
+                                    "原因": "未知异常",
+                                    "异常信息": str(e),
+                                    "书籍": current_book["title"],
+                                    "模型": model_name if model_name else "未知"
+                                }, status="ERROR")
+                                st.error(f"图谱生成失败：{str(e)}")
+            
+            with c_tools_2:
+                # 留空保持对齐
+                pass
+                
+            with c_tools_3:
+                # 🔥 添加图谱头像大小调节滑块
+                st.markdown('<div class="graph-avatar-slider">', unsafe_allow_html=True)
+                if 'graph_avatar_size' not in st.session_state:
+                    st.session_state.graph_avatar_size = 80
+                
+                graph_avatar_size = st.slider(
+                    "图谱头像大小",
+                    min_value=40,
+                    max_value=200,
+                    value=st.session_state.graph_avatar_size,
+                    step=5,
+                    key="graph_size_slider",
+                    label_visibility="collapsed"
+                )
+                st.session_state.graph_avatar_size = graph_avatar_size
+                st.markdown('</div>', unsafe_allow_html=True)
             
             relations_data = saved_relations if saved_relations else []
             try:
                 role_colors = {
                     "主角": "#d32f2f", "双主角": "#d32f2f", "反派BOSS": "#212121",
-                    "主要配角": "#1976d2", "次要配角": "#64b5f6", "挚友/死党": "#388e3c",
+                    "主要配角": "#1976d2", "次要配件": "#64b5f6", "挚友/死党": "#388e3c",
                     "暗恋者/伴侣": "#e91e63", "导师/师父": "#fbc02d", "default": "#9e9e9e"
                 }
 
@@ -755,7 +1277,9 @@ def render_characters(engine, current_book_arg=None):
                     node_ids.add(char_id)
                     
                     color = role_colors.get(char.get('role'), role_colors["default"])
-                    size = 35 if char.get('is_major') else 20
+                    # 🔥 使用图谱头像大小滑块的值
+                    base_size = st.session_state.get('graph_avatar_size', 80)
+                    size = base_size if char.get('is_major') else int(base_size * 0.75)
                     
                     # 🔥 获取头像内容
                     avatar_path = char.get('avatar', '')
@@ -805,6 +1329,38 @@ def render_characters(engine, current_book_arg=None):
                 edges = []
                 seen_edges = set()
                 
+                # 🔥 算法提炼简单关系词
+                def extract_simple_relation(full_label):
+                    """从完整关系描述中提取简单关系词"""
+                    if not full_label:
+                        return "相关"
+                    
+                    # 常见关系词映射
+                    relation_map = {
+                        "师徒": ["师徒", "师父", "徒弟", "传道", "授业"],
+                        "伴侣": ["夫妻", "道侣", "情侣", "恋人", "伴侣", "配偶"],
+                        "亲人": ["父子", "母女", "兄弟", "姐妹", "兄妹", "姐弟", "亲属", "亲戚"],
+                        "朋友": ["好友", "朋友", "挚友", "死党", "兄弟", "姐妹"],
+                        "敌对": ["仇敌", "敌人", "对手", "宿敌", "死对头"],
+                        "师徒": ["师父", "徒弟", "师徒", "传人", "弟子"],
+                        "上下级": ["主仆", "君臣", "上司", "下属", "领导"],
+                        "恩人": ["救命恩人", "恩人", "有恩"],
+                        "仇人": ["仇人", "血仇", "世仇", "死仇"]
+                    }
+                    
+                    full_label_lower = full_label.lower()
+                    
+                    for simple_rel, keywords in relation_map.items():
+                        for keyword in keywords:
+                            if keyword in full_label_lower:
+                                return simple_rel
+                    
+                    # 如果没匹配到，取前2-4个字符
+                    if len(full_label) <= 4:
+                        return full_label
+                    else:
+                        return full_label[:3] + ".."
+                
                 for rel in relations_data:
                     source_id = rel.get('source')
                     target_id = rel.get('target')
@@ -816,19 +1372,35 @@ def render_characters(engine, current_book_arg=None):
                             continue
                         seen_edges.add(edge_key)
                         
-                        full_label = rel.get('label', '')
-                        display_label = full_label[:5] + ".." if len(full_label) > 5 else full_label
+                        full_label = rel.get('label', '相关')
+                        # 🔥 使用算法提炼简单关系词，显示在连线上
+                        simple_label = extract_simple_relation(full_label)
+                        
+                        # 🔥 构建详细的关系起因缘由（鼠标悬停时显示）- 删掉"关系详情:"前缀
+                        detailed_description = f"{full_label}"
+                        if 'description' in rel and rel['description']:
+                            detailed_description += f"\n{rel['description']}"
+                        elif 'reason' in rel and rel['reason']:
+                            detailed_description += f"\n{rel['reason']}"
+                        elif 'detail' in rel and rel['detail']:
+                            detailed_description += f"\n{rel['detail']}"
                         
                         edges.append({
                             "from": source_id,
                             "to": target_id,
-                            "label": display_label, 
-                            "title": full_label,    
+                            "label": simple_label,  # 🔥 连线上显示简单关系词
+                            "title": detailed_description,  # 🔥 鼠标悬停显示详细起因缘由
                             "width": max(1, rel.get('weight', 1) * 0.8)
                         })
                 
                 if nodes:
-                    html_code = generate_graph_html(nodes, edges, height="600px")
+                    # 🔥 统计信息
+                    stats = {
+                        "char_count": len(nodes),
+                        "relation_count": len(edges)
+                    }
+                    
+                    html_code = generate_graph_html(nodes, edges, height="600px", stats=stats)
                     components.html(html_code, height=620, scrolling=False)
                 else:
                     st.info("没有可显示的节点")
@@ -880,7 +1452,6 @@ def render_characters(engine, current_book_arg=None):
             
             desc = st.text_area("综合简介", height=150, key="manual_desc")
             
-            st.markdown("---")
             st.markdown("**🔗 初始关系绑定**")
             
             char_rows = db_mgr.query("SELECT id, name FROM characters WHERE book_id=?", (current_book_id,))
@@ -896,10 +1467,17 @@ def render_characters(engine, current_book_arg=None):
                     exist_check = db_mgr.query("SELECT id FROM characters WHERE book_id=? AND name=?", (current_book_id, name))
                     if exist_check:
                         st.warning(f"角色 {name} 已存在，请勿重复添加。")
+                        log_audit_event("角色管理", "重复添加角色", {
+                            "角色名称": name,
+                            "书籍名称": current_book["title"],
+                            "书籍ID": current_book_id,
+                            "状态": "已存在，未添加"
+                        }, status="WARNING")
                     else:
                         final_av = av_url
                         if up_new_add:
                              temp_id = int(time.time())
+                             # 🔥 修复1: 将new_file改为up_new_add
                              saved_path = save_avatar_file(up_new_add, temp_id)
                              if saved_path: 
                                  final_av = saved_path
@@ -934,7 +1512,16 @@ def render_characters(engine, current_book_arg=None):
                             save_relations_to_disk(current_book_id, current_relations)
 
                         update_book_timestamp_by_book_id(current_book_id)
-                        log_operation('角色', f'手动添加角色：{name}')
+                        log_audit_event("角色管理", "手动添加角色", {
+                            "角色名称": name,
+                            "角色ID": new_char_id,
+                            "书籍名称": current_book["title"],
+                            "书籍ID": current_book_id,
+                            "定位": role_sel,
+                            "性别": gen_sel,
+                            "种族": race_sel,
+                            "关系绑定": f"{rel_target_name}: {rel_desc}" if rel_target_name != "(无)" else "无"
+                        })
                         st.toast(f"✅ {name} 已添加！")
                         time.sleep(0.5)
                         st.rerun()
@@ -982,7 +1569,15 @@ def render_characters(engine, current_book_arg=None):
                             if st.button("更新关系", type="primary", width="stretch"):
                                 current_relations[existing_idx]['label'] = rel_label
                                 save_relations_to_disk(current_book_id, current_relations)
-                                log_operation('角色', f'更新关系：{src_name}-{tgt_name} ({rel_label})')
+                                log_audit_event("关系管理", "更新角色关系", {
+                                    "角色A": src_name,
+                                    "角色B": tgt_name,
+                                    "角色A_ID": src_id,
+                                    "角色B_ID": tgt_id,
+                                    "关系描述": rel_label,
+                                    "书籍名称": current_book["title"],
+                                    "书籍ID": current_book_id
+                                })
                                 st.toast("✅ 关系已更新")
                                 time.sleep(0.5)
                                 st.rerun()
@@ -990,7 +1585,14 @@ def render_characters(engine, current_book_arg=None):
                             if st.button("删除连线", type="secondary", width="stretch"):
                                 current_relations.pop(existing_idx)
                                 save_relations_to_disk(current_book_id, current_relations)
-                                log_operation('角色', f'删除关系：{src_name}-{tgt_name}')
+                                log_audit_event("关系管理", "删除角色关系", {
+                                    "角色A": src_name,
+                                    "角色B": tgt_name,
+                                    "角色A_ID": src_id,
+                                    "角色B_ID": tgt_id,
+                                    "书籍名称": current_book["title"],
+                                    "书籍ID": current_book_id
+                                }, status="WARNING")
                                 st.toast("🗑️ 关系已删除")
                                 time.sleep(0.5)
                                 st.rerun()
@@ -1004,22 +1606,74 @@ def render_characters(engine, current_book_arg=None):
                             }
                             current_relations.append(new_rel)
                             save_relations_to_disk(current_book_id, current_relations)
-                            log_operation('角色', f'新建关系：{src_name}-{tgt_name} ({rel_label})')
+                            log_audit_event("关系管理", "新建角色关系", {
+                                "角色A": src_name,
+                                "角色B": tgt_name,
+                                "角色A_ID": src_id,
+                                "角色B_ID": tgt_id,
+                                "关系描述": rel_label,
+                                "书籍名称": current_book["title"],
+                                "书籍ID": current_book_id
+                            })
                             st.toast("✅ 关系已建立")
                             time.sleep(0.5)
                             st.rerun()
 
         # --- Tab 3: 列表管理 ---
         with tab_list:
-            c_count, c_view = st.columns([2, 1])
-            with c_count:
-                 rows = db_mgr.query("SELECT * FROM characters WHERE book_id=? ORDER BY is_major DESC, id DESC", (current_book_id,))
-                 count = len(rows) if rows else 0
-                 st.markdown(f"**共 {count} 名角色** <span style='color:grey;font-size:0.8em'>(已按重要性排序)</span>", unsafe_allow_html=True)
-            with c_view:
-                 avatar_shape = st.radio("头像形状", ["⚪ 圆形", "⬜ 方形"], index=0, horizontal=True, label_visibility="collapsed", key="shape_toggle")
+            rows = db_mgr.query("SELECT * FROM characters WHERE book_id=? ORDER BY is_major DESC, id DESC", (current_book_id,))
+            count = len(rows) if rows else 0
             
-            radius_style = "50%" if avatar_shape == "⚪ 圆形" else "6px"
+            # 🔥 使用两列布局：滑块和形状切换，设置垂直对齐为居中
+            col_slider, col_shape = st.columns([1, 1], gap="small", vertical_alignment="center")
+            
+            with col_slider:
+                # 滑块容器 - 使用修复后的样式
+                st.markdown('<div class="list-management-slider-container">', unsafe_allow_html=True)
+                if 'avatar_size' not in st.session_state:
+                    st.session_state.avatar_size = 80
+                
+                avatar_size = st.slider(
+                    "列表头像大小",
+                    min_value=40,
+                    max_value=120,
+                    value=st.session_state.avatar_size,
+                    step=5,
+                    key="list_size_slider",
+                    label_visibility="collapsed"
+                )
+                st.session_state.avatar_size = avatar_size
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            with col_shape:
+                # 形状切换容器 - 使用修复后的样式
+                st.markdown('<div class="list-management-shape-container avatar-shape-toggle">', unsafe_allow_html=True)
+                
+                # 🔥 修复头像形状切换问题：使用回调函数更新session_state
+                def update_avatar_shape():
+                    avatar_shape = st.session_state.shape_toggle
+                    st.session_state.avatar_shape_radius = "50%" if avatar_shape == "⚪ 圆形" else "6px"
+                
+                avatar_shape = st.radio(
+                    "头像形状", 
+                    ["⚪ 圆形", "⬜ 方形"], 
+                    index=0, 
+                    horizontal=True, 
+                    key="shape_toggle",
+                    label_visibility="collapsed",
+                    on_change=update_avatar_shape
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # 🔥 修复：确保头像形状切换立即生效
+            if 'avatar_shape_radius' not in st.session_state:
+                st.session_state.avatar_shape_radius = "50%"
+            
+            # 更新头像形状的半径值
+            if avatar_shape == "⚪ 圆形":
+                st.session_state.avatar_shape_radius = "50%"
+            else:
+                st.session_state.avatar_shape_radius = "6px"
             
             if not rows:
                 st.info("暂无角色")
@@ -1040,7 +1694,7 @@ def render_characters(engine, current_book_arg=None):
                         kp = f"cedit_{ch['id']}"
                         
                         # 🔥 修复头像和文本框垂直对齐问题
-                        c_thumb, c_name = st.columns([1, 4], vertical_alignment="center")
+                        c_thumb, c_name = st.columns([1, 3], vertical_alignment="center")
                         
                         with c_thumb:
                              img_src = get_node_image_content(ch.get('avatar'))
@@ -1048,36 +1702,67 @@ def render_characters(engine, current_book_arg=None):
                                  img_src = get_default_avatar(ch['name'])
                              
                              if img_src:
-                                 # 使用自定义容器确保垂直居中
+                                 # 🔥 使用动态头像尺寸
+                                 avatar_size = st.session_state.get('avatar_size', 80)
+                                 current_radius = st.session_state.avatar_shape_radius
+                                 avatar_id = f"avatar_{ch['id']}"
+                                 
                                  st.markdown(f"""
                                  <div class="avatar-container">
-                                     <img src="{img_src}" style="
-                                         width: 60px; 
-                                         height: 60px; 
-                                         border-radius: {radius_style}; 
-                                         object-fit: cover; 
-                                         border: 1px solid #ddd; 
-                                         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-                                     ">
+                                     <div class="avatar-preview" onclick="showAvatarModal_{avatar_id}()">
+                                         <img id="{avatar_id}" src="{img_src}" style="
+                                             width: {avatar_size}px;
+                                             height: {avatar_size}px;
+                                             border-radius: {current_radius};
+                                             object-fit: cover; 
+                                             border: 1px solid #ddd; 
+                                             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                                             cursor: pointer;
+                                             transition: all 0.3s ease-in-out;
+                                         " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+                                     </div>
                                  </div>
+                                 
+                                 <script>
+                                 function showAvatarModal_{avatar_id}() {{
+                                     const imgSrc = document.getElementById('{avatar_id}').src;
+                                     const modal = document.createElement('div');
+                                     modal.className = 'avatar-modal';
+                                     modal.innerHTML = `
+                                         <div class="avatar-modal-close" onclick="this.parentElement.remove()">×</div>
+                                         <img src="${{imgSrc}}" style="max-width: 80vw; max-height: 80vh;">
+                                     `;
+                                     document.body.appendChild(modal);
+                                     modal.onclick = function(e) {{
+                                         if (e.target.className === 'avatar-modal') {{
+                                             modal.remove();
+                                         }}
+                                     }};
+                                 }}
+                                 </script>
                                  """, unsafe_allow_html=True)
                              else:
+                                 # 🔥 使用动态头像尺寸
+                                 avatar_size = st.session_state.get('avatar_size', 80)
+                                 current_radius = st.session_state.avatar_shape_radius
+                                 
                                  st.markdown(f"""
                                  <div class="avatar-container">
                                      <div style="
-                                         width: 60px; 
-                                         height: 60px; 
-                                         border-radius: {radius_style}; 
+                                         width: {avatar_size}px;
+                                         height: {avatar_size}px;
+                                         border-radius: {current_radius};
                                          background-color: #f0f2f6; 
                                          color: #555; 
                                          font-size: 20px; 
-                                         line-height: 60px; 
+                                         line-height: {avatar_size}px;
                                          text-align: center; 
                                          border: 1px solid #ddd;
                                          display: flex;
                                          align-items: center;
                                          justify-content: center;
-                                     ">?</div>
+                                         transition: all 0.3s ease-in-out;
+                                     " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">?</div>
                                  </div>
                                  """, unsafe_allow_html=True)
                         
@@ -1087,12 +1772,42 @@ def render_characters(engine, current_book_arg=None):
                              n_new = st.text_input("姓名", ch['name'], key=f"{kp}_n", label_visibility="collapsed")
                              st.markdown('</div>', unsafe_allow_html=True)
 
+                        # 🔥 修复：添加定位编辑功能
+                        c_role, c_gender = st.columns(2)
+                        with c_role:
+                            # 使用当前角色的定位作为默认值
+                            current_role = ch.get('role', '路人')
+                            role_options = st.session_state.role_options + ["自定义..."]
+                            # 如果当前角色定位不在选项中，则添加到选项中
+                            if current_role not in role_options and current_role != "自定义...":
+                                role_options = [current_role] + role_options
+                            role_idx = 0
+                            if current_role in role_options:
+                                role_idx = role_options.index(current_role)
+                            r_new = st.selectbox("定位", role_options, index=role_idx, key=f"{kp}_role")
+                            check_and_trigger_custom(r_new, "role_options", f"{kp}_role")
+                        
+                        with c_gender:
+                            current_gender = ch.get('gender', '男')
+                            gender_options = st.session_state.gender_options + ["自定义..."]
+                            if current_gender not in gender_options and current_gender != "自定义...":
+                                gender_options = [current_gender] + gender_options
+                            gender_idx = 0
+                            if current_gender in gender_options:
+                                gender_idx = gender_options.index(current_gender)
+                            g_new = st.selectbox("性别", gender_options, index=gender_idx, key=f"{kp}_gender")
+                            check_and_trigger_custom(g_new, "gender_options", f"{kp}_gender")
+
                         with st.expander("📝 详细属性 (点击展开编辑)", expanded=False):
                             c_e1, c_e2 = st.columns(2)
                             e_orig = c_e1.text_input("出身", value=ch.get('origin') or "", key=f"{kp}_orig")
                             e_prof = c_e2.text_input("职业", value=ch.get('profession') or "", key=f"{kp}_prof")
                             
-                            e_cheat = st.text_input("金手指", value=ch.get('cheat_ability') or "", key=f"{kp}_cheat")
+                            # 🔥 金手指没有内容时显示"无"，不要显示none
+                            cheat_value = ch.get('cheat_ability', '')
+                            if cheat_value is None or cheat_value == 'None' or cheat_value == 'none':
+                                cheat_value = "无"
+                            e_cheat = st.text_input("金手指", value=cheat_value, key=f"{kp}_cheat")
                             
                             c_e3, c_e4 = st.columns(2)
                             e_lvl = c_e3.text_input("境界", value=ch.get('power_level') or "", key=f"{kp}_lvl")
@@ -1105,21 +1820,57 @@ def render_characters(engine, current_book_arg=None):
 
                         c_del, c_save = st.columns([1, 1])
                         if c_del.button("删除", key=f"del_{ch['id']}", type="secondary", width="stretch"):
-                             db_mgr.execute("DELETE FROM characters WHERE id=?", (ch['id'],))
-                             update_book_timestamp_by_book_id(current_book_id)
-                             st.rerun()
+                            # 🔥 记录删除角色日志
+                            log_audit_event("角色管理", "删除角色", {
+                                "角色名称": ch['name'],
+                                "角色ID": ch['id'],
+                                "书籍名称": current_book["title"],
+                                "书籍ID": current_book_id,
+                                "定位": ch.get('role', '未知'),
+                                "删除时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }, status="WARNING")
+                            
+                            db_mgr.execute("DELETE FROM characters WHERE id=?", (ch['id'],))
+                            update_book_timestamp_by_book_id(current_book_id)
+                            st.toast(f"🗑️ {ch['name']} 已删除")
+                            time.sleep(0.5)
+                            st.rerun()
                              
                         if c_save.button("保存", key=f"save_{ch['id']}", type="primary", width="stretch"):
-                             db_mgr.execute("""
+                            # 🔥 记录修改角色日志
+                            log_audit_event("角色管理", "修改角色信息", {
+                                "角色名称": ch['name'],
+                                "角色ID": ch['id'],
+                                "书籍名称": current_book["title"],
+                                "书籍ID": current_book_id,
+                                "修改内容": {
+                                    "姓名": {"原值": ch['name'], "新值": n_new} if n_new != ch['name'] else None,
+                                    "定位": {"原值": ch.get('role', ''), "新值": r_new} if r_new != ch.get('role', '') else None,
+                                    "性别": {"原值": ch.get('gender', ''), "新值": g_new} if g_new != ch.get('gender', '') else None,
+                                    "出身": {"原值": ch.get('origin', ''), "新值": e_orig} if e_orig != ch.get('origin', '') else None,
+                                    "职业": {"原值": ch.get('profession', ''), "新值": e_prof} if e_prof != ch.get('profession', '') else None,
+                                    "金手指": {"原值": ch.get('cheat_ability', ''), "新值": "" if e_cheat == "无" else e_cheat} if ("" if e_cheat == "无" else e_cheat) != ch.get('cheat_ability', '') else None,
+                                    "境界": {"原值": ch.get('power_level', ''), "新值": e_lvl} if e_lvl != ch.get('power_level', '') else None,
+                                    "代价": {"原值": ch.get('ability_limitations', ''), "新值": e_lim} if e_lim != ch.get('ability_limitations', '') else None,
+                                    "标志/外貌": {"原值": ch.get('appearance_features', ''), "新值": e_sign} if e_sign != ch.get('appearance_features', '') else None,
+                                    "关系/恩仇": {"原值": ch.get('relationship_to_protagonist', ''), "新值": e_rel} if e_rel != ch.get('relationship_to_protagonist', '') else None,
+                                    "描述": {"原值": ch.get('desc', ''), "新值": d_new} if d_new != ch.get('desc', '') else None
+                                }
+                            })
+                            
+                            # 🔥 保存时，如果金手指是"无"，则保存为空字符串
+                            final_cheat = "" if e_cheat == "无" else e_cheat
+                            db_mgr.execute("""
                                 UPDATE characters SET 
-                                name=?, desc=?, origin=?, profession=?, cheat_ability=?, 
+                                name=?, role=?, gender=?, desc=?, origin=?, profession=?, cheat_ability=?, 
                                 power_level=?, ability_limitations=?, appearance_features=?, relationship_to_protagonist=?
                                 WHERE id=?
-                             """, (n_new, d_new, e_orig, e_prof, e_cheat, e_lvl, e_lim, e_sign, e_rel, ch['id']))
+                             """, (n_new, r_new, g_new, d_new, e_orig, e_prof, final_cheat, e_lvl, e_lim, e_sign, e_rel, ch['id']))
                              
-                             update_book_timestamp_by_book_id(current_book_id)
-                             st.toast("✅ 保存成功")
-                             st.rerun()
+                            update_book_timestamp_by_book_id(current_book_id)
+                            st.toast("✅ 保存成功")
+                            time.sleep(0.5)
+                            st.rerun()
 
         # --- Tab 4: AI 提取 ---
         with tab_ai:
@@ -1145,7 +1896,6 @@ def render_characters(engine, current_book_arg=None):
             extracted_data = st.session_state.get(f"extracted_chars_{current_book_id}", [])
             
             if extracted_data:
-                st.divider()
                 st.write(f"📊 **待确认导入角色：{len(extracted_data)} 人**")
                 
                 if st.button("📥 全部导入 (含角色关系)", type="primary", width="stretch"):
@@ -1160,50 +1910,73 @@ def render_characters(engine, current_book_arg=None):
 
                     pending_relations = []
                     new_char_count = 0
+                    
+                    # 🔥 改进的去重逻辑：同时检查现有角色和本次提取的角色，避免重复
+                    seen_names_in_this_batch = set()
 
                     for char_data in extracted_data:
                         raw_name = char_data.get('name', '').strip()
                         if not raw_name: 
                             continue
                         
-                        # 🔥 如果已存在，则记录 ID 并跳过插入
-                        if raw_name in name_id_map:
-                            print(f"角色 [{raw_name}] 已存在，跳过创建。")
-                            # 仍需处理该角色的关系数据，所以不做 continue
-                        else:
-                            try:
-                                cid = db_mgr.execute(
-                                    """INSERT INTO characters (
-                                        book_id, name, role, gender, race, desc, is_major, avatar,
-                                        origin, profession, cheat_ability, power_level, ability_limitations,
-                                        appearance_features, signature_sign, relationship_to_protagonist, social_role, debts_and_feuds
-                                    ) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?)""",
-                                    (
-                                        current_book_id, 
-                                        raw_name, 
-                                        char_data.get('role', '路人'), 
-                                        char_data.get('gender', '未知'), 
-                                        char_data.get('race', '人族'), 
-                                        char_data.get('desc', ''), 
-                                        char_data.get('is_major', False), 
-                                        char_data.get('avatar', ''),
-                                        char_data.get('origin', ''),
-                                        char_data.get('profession', ''),
-                                        char_data.get('cheat_ability', ''),
-                                        char_data.get('power_level', ''),
-                                        char_data.get('ability_limitations', ''),
-                                        char_data.get('appearance_features', ''),
-                                        char_data.get('signature_sign', ''),
-                                        char_data.get('relationship_to_protagonist', ''),
-                                        char_data.get('social_role', ''),
-                                        char_data.get('debts_and_feuds', '')
-                                    )
+                        # 🔥 检查本次提取中是否有重复的名字（忽略大小写和空格）
+                        cleaned_name = raw_name.lower()
+                        if cleaned_name in seen_names_in_this_batch:
+                            print(f"⚠️ 本次提取中发现重复角色 [{raw_name}]，跳过创建。")
+                            continue
+                        seen_names_in_this_batch.add(cleaned_name)
+                        
+                        # 🔥 检查数据库中是否已存在（忽略大小写和空格）
+                        name_exists = False
+                        for existing_name in name_id_map.keys():
+                            if existing_name.lower() == cleaned_name:
+                                name_exists = True
+                                print(f"角色 [{raw_name}] 已存在（数据库中有 {existing_name}），跳过创建。")
+                                # 记录已有的ID，以便后续处理关系
+                                name_id_map[raw_name] = name_id_map[existing_name]
+                                break
+                        
+                        if name_exists:
+                            continue
+                            
+                        try:
+                            # 🔥 处理金手指，如果为None或空则设为空字符串
+                            cheat_ability = char_data.get('cheat_ability', '')
+                            if cheat_ability is None or cheat_ability == 'None' or cheat_ability == 'none':
+                                cheat_ability = ''
+                                
+                            cid = db_mgr.execute(
+                                """INSERT INTO characters (
+                                    book_id, name, role, gender, race, desc, is_major, avatar,
+                                    origin, profession, cheat_ability, power_level, ability_limitations,
+                                    appearance_features, signature_sign, relationship_to_protagonist, social_role, debts_and_feuds
+                                ) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?)""",
+                                (
+                                    current_book_id, 
+                                    raw_name, 
+                                    char_data.get('role', '路人'), 
+                                    char_data.get('gender', '未知'), 
+                                    char_data.get('race', '人族'), 
+                                    char_data.get('desc', ''), 
+                                    char_data.get('is_major', False), 
+                                    char_data.get('avatar', ''),
+                                    char_data.get('origin', ''),
+                                    char_data.get('profession', ''),
+                                    cheat_ability,
+                                    char_data.get('power_level', ''),
+                                    char_data.get('ability_limitations', ''),
+                                    char_data.get('appearance_features', ''),
+                                    char_data.get('signature_sign', ''),
+                                    char_data.get('relationship_to_protagonist', ''),
+                                    char_data.get('social_role', ''),
+                                    char_data.get('debts_and_feuds', '')
                                 )
-                                name_id_map[raw_name] = cid
-                                new_char_count += 1
-                            except Exception as e: 
-                                print(f"Insert Error: {e}")
-                                pass
+                            )
+                            name_id_map[raw_name] = cid
+                            new_char_count += 1
+                        except Exception as e: 
+                            print(f"Insert Error: {e}")
+                            pass
                         
                         # 收集该角色的关系数据
                         if 'relationships' in char_data and isinstance(char_data['relationships'], list):
@@ -1246,6 +2019,16 @@ def render_characters(engine, current_book_arg=None):
 
                     st.session_state[f"extracted_chars_{current_book_id}"] = []
                     update_book_timestamp_by_book_id(current_book_id)
+                    
+                    log_audit_event("AI提取", "批量导入AI提取角色", {
+                        "书籍名称": current_book["title"],
+                        "书籍ID": current_book_id,
+                        "新增角色数": new_char_count,
+                        "新增关系数": new_rel_count,
+                        "过滤重复数": len(extracted_data) - new_char_count,
+                        "导入时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    
                     st.toast(f"导入成功！新增角色 {new_char_count} 人，建立关系 {new_rel_count} 条。")
                     time.sleep(1)
                     st.rerun()
@@ -1262,5 +2045,6 @@ def render_characters(engine, current_book_arg=None):
                             if char_data.get('relationships'):
                                 rels = [f"{r['target']}({r['label']})" for r in char_data['relationships']]
                                 st.caption(f"🔗 关系: {', '.join(rels)}")
-                            if char_data.get('cheat_ability'):
-                                st.caption(f"✨ 能力: {char_data.get('cheat_ability')}")
+                            cheat_value = char_data.get('cheat_ability', '')
+                            if cheat_value and cheat_value != 'None' and cheat_value != 'none':
+                                st.caption(f"✨ 能力: {cheat_value}")

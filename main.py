@@ -138,7 +138,19 @@ for k, v in defaults.items():
         else: st.session_state[k] = v
 
 if 'sidebar_collapsed' not in st.session_state: st.session_state.sidebar_collapsed = False
-if 'db' not in st.session_state: st.session_state.db = DatabaseManager(DB_FILE)
+
+# ==========================================
+# 【核心修改点】数据库初始化与自动清理
+# ==========================================
+if 'db' not in st.session_state: 
+    # 初始化数据库连接
+    st.session_state.db = DatabaseManager(DB_FILE)
+    
+    # 🔥 自动执行一次数据清理
+    # 这样每次 App 启动/重置时，会自动删除那些“没书的章节”和“没书的角色”
+    # 确保数据看板的数字是 100% 准确的
+    st.session_state.db.clean_orphaned_data()
+
 engine = LogicEngine(st.session_state.db)
 
 st.markdown(get_theme_css(), unsafe_allow_html=True)

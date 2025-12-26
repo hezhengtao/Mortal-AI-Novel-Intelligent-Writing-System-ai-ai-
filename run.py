@@ -70,40 +70,89 @@ class RECT(Structure):
 class MONITORINFO(Structure):
     _fields_ = [("cbSize", c_long), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", c_long)]
 
-GWL_STYLE = -16
-WS_MINIMIZEBOX = 0x00020000
-WS_MAXIMIZEBOX = 0x00010000
-WS_SYSMENU     = 0x00080000 
+# --- 窗口样式常量 ---
+GWL_STYLE   = -16
+GWL_EXSTYLE = -20
+
+# 样式位定义
+WS_POPUP       = 0x80000000  # 保持 POPUP (原版样式)，解决几何错乱/缝隙问题
+WS_MINIMIZEBOX = 0x00020000  # 必须开启：支持最小化
+WS_MAXIMIZEBOX = 0x00010000  # 必须开启：支持最大化
+WS_SYSMENU     = 0x00080000  # 必须开启：系统菜单
+
+# 扩展样式
+WS_EX_APPWINDOW  = 0x00040000 # [关键] 强制任务栏将其视为主窗口，支持点击最小化
+WS_EX_TOOLWINDOW = 0x00000080 # 工具窗口，必须移除
+
+# 窗口显示命令
+SW_HIDE = 0
+SW_SHOW = 5
+
+# 刷新标志
 SWP_NOZORDER     = 0x0004
 SWP_NOACTIVATE   = 0x0010
 SWP_FRAMECHANGED = 0x0020
+SWP_NOMOVE       = 0x0002
+SWP_NOSIZE       = 0x0001
 MONITOR_DEFAULTTONEAREST = 0x00000002
 
 def force_window_styles():
     """
-    使用 FindWindowW 精准查找窗口，解决竞态条件问题。
+    【V8 原生增强版】
+    解决所有问题的最终逻辑：
+    1. 保持 WS_POPUP 不变！这解决了 "窗口变小"、"乱跑" 和 "最大化有缝隙" 的问题。
+    2. 仅注入 WS_EX_APPWINDOW 和 WS_MINIMIZEBOX。这解决了 "任务栏点击无效" 的问题。
+    3. 使用 Hide/Show 大法强制刷新任务栏注册状态。
     """
     target_title = "凡人智能写作系统"
     hwnd = 0
     
-    # 尝试 20 次，每次间隔 0.25 秒
-    for _ in range(20):
+    # 1. 寻找窗口
+    for _ in range(100):
         hwnd = windll.user32.FindWindowW(None, target_title)
-        if hwnd:
-            break
+        if hwnd: break
         time.sleep(0.25)
     
     if not hwnd:
         print("Style Fix Warning: Could not find window handle.")
         return
 
+    # 2. 等待 WebView2 加载 (防止黑屏)
+    time.sleep(3.0)
+
     try:
+        # 3. [关键步骤] 先隐藏窗口
+        # 这一步是为了让 Windows 重新评估窗口在任务栏的状态
+        windll.user32.ShowWindow(hwnd, SW_HIDE)
+        
+        # 4. 获取当前样式
         style = windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+
+        # 5. [核心修改]
+        # 不要移除 WS_POPUP！保留它！保留它！(解决几何问题)
+        # 只添加控制按钮
         style = style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+        
+        # 修正扩展样式：
+        # 强制添加 APPWINDOW (解决任务栏交互)
+        # 强制移除 TOOLWINDOW
+        ex_style = ex_style | WS_EX_APPWINDOW
+        ex_style = ex_style & ~WS_EX_TOOLWINDOW
+
+        # 6. 应用样式
+        windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style)
         windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+        
+        # 刷新状态，但不改变大小和位置 (NOMOVE | NOSIZE)
         windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 
-                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | 0x0001 | 0x0002)
-        print(f"Style Fix Applied to HWND: {hwnd}")
+                                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE)
+
+        # 7. 重新显示窗口
+        windll.user32.ShowWindow(hwnd, SW_SHOW)
+        
+        print(f"Style Fix Applied: Kept POPUP (Fixed Geometry) + Added APPWINDOW (Fixed Taskbar) for HWND: {hwnd}")
+        
     except Exception as e:
         print(f"Style Fix Error: {e}")
 
@@ -318,6 +367,7 @@ class Api:
             self._restore_rect = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
 
     def _apply_window_rect(self, hwnd, mode):
+        # 修复：确保 MONITORINFO 已定义
         if mode == 'restore':
             if self._restore_rect:
                 x, y, w, h = self._restore_rect
@@ -393,6 +443,7 @@ def master_logic(window, api):
     t_st = threading.Thread(target=run_streamlit_thread, daemon=True)
     t_st.start()
     
+    # 启动样式修正线程（V8 Final）
     threading.Thread(target=force_window_styles).start()
     
     HTTP_READY.wait(timeout=10)

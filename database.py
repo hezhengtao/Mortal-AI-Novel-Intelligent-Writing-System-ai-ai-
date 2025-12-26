@@ -154,6 +154,73 @@ class DatabaseManager:
         
         self.conn.commit()
         cursor.close()
+
+    # ==========================================================
+    # 【新增】核心修复功能：清理孤儿数据 & 彻底删除书籍
+    # ==========================================================
+    def clean_orphaned_data(self):
+        """清理孤儿数据（没有对应书或卷的数据），解决数据看板虚高问题"""
+        cursor = self.conn.cursor()
+        try:
+            # 1. 清理没有对应【卷】的章节
+            cursor.execute("DELETE FROM chapters WHERE volume_id NOT IN (SELECT id FROM volumes)")
+            deleted_chapters = cursor.rowcount
+            
+            # 2. 清理没有对应【书】的卷
+            cursor.execute("DELETE FROM volumes WHERE book_id NOT IN (SELECT id FROM books)")
+            deleted_volumes = cursor.rowcount
+
+            # 3. 清理没有对应【书】的分卷
+            cursor.execute("DELETE FROM parts WHERE book_id NOT IN (SELECT id FROM books)")
+            
+            # 4. 清理没有对应【书】的角色
+            cursor.execute("DELETE FROM characters WHERE book_id NOT IN (SELECT id FROM books)")
+            deleted_chars = cursor.rowcount
+            
+            # 5. 清理没有对应【书】的大纲
+            cursor.execute("DELETE FROM plots WHERE book_id NOT IN (SELECT id FROM books)")
+            
+            # 6. 清理没有对应【书】的分类关联
+            cursor.execute("DELETE FROM book_categories WHERE book_id NOT IN (SELECT id FROM books)")
+
+            self.conn.commit()
+            if deleted_chapters > 0 or deleted_volumes > 0 or deleted_chars > 0:
+                print(f"🧹 [DB Clean] 已清理: {deleted_chapters}章, {deleted_volumes}卷, {deleted_chars}角色")
+            return True
+        except Exception as e:
+            print(f"❌ 清理失败: {e}")
+            self.conn.rollback()
+            return False
+        finally:
+            cursor.close()
+
+    def delete_book_fully(self, book_id):
+        """彻底删除一本书及其所有关联数据（级联删除）"""
+        cursor = self.conn.cursor()
+        try:
+            # 1. 删章节 (通过卷找到章节)
+            cursor.execute("DELETE FROM chapters WHERE volume_id IN (SELECT id FROM volumes WHERE book_id=?)", (book_id,))
+            
+            # 2. 删卷和分卷
+            cursor.execute("DELETE FROM volumes WHERE book_id=?", (book_id,))
+            cursor.execute("DELETE FROM parts WHERE book_id=?", (book_id,))
+            
+            # 3. 删角色、大纲、分类关联
+            cursor.execute("DELETE FROM characters WHERE book_id=?", (book_id,))
+            cursor.execute("DELETE FROM plots WHERE book_id=?", (book_id,))
+            cursor.execute("DELETE FROM book_categories WHERE book_id=?", (book_id,))
+            
+            # 4. 最后删书
+            cursor.execute("DELETE FROM books WHERE id=?", (book_id,))
+            
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"删除书籍失败: {e}")
+            self.conn.rollback()
+            return False
+        finally:
+            cursor.close()
             
     def update_book_timestamp(self, book_id):
         self.execute("UPDATE books SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (book_id,))

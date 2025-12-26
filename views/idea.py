@@ -3,10 +3,109 @@
 import streamlit as st
 import os
 import time
-from utils import render_header, log_operation
-from logic import FEATURE_MODELS
+import json
+import csv
+import uuid
+import threading
+from datetime import datetime
+from utils import render_header # log_operation 已废弃
+
+# 🔥 导入 OpenAI 类，以便在自定义模型解析中实例化
+from logic import FEATURE_MODELS, OpenAI
+
 # 🛠️ 修正导入：从 config 导入 DATA_DIR
 from config import DATA_DIR
+
+# ==============================================================================
+# 🛡️ 严格审计日志系统 (Idea 集成版)
+# ==============================================================================
+
+SYSTEM_LOG_PATH = os.path.join(DATA_DIR, "logs", "system_audit.csv")
+_log_lock = threading.Lock()
+
+def get_session_id():
+    """获取或生成当前会话的唯一追踪ID"""
+    if "session_trace_id" not in st.session_state:
+        st.session_state.session_trace_id = str(uuid.uuid4())[:8]
+    return st.session_state.session_trace_id
+
+def log_audit_event(category, action, details, status="SUCCESS", module="IDEA"):
+    """
+    执行严格的审计日志写入
+    """
+    try:
+        os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_id = get_session_id()
+        
+        status_map = {"SUCCESS": "成功", "WARNING": "警告", "ERROR": "错误"}
+        status_cn = status_map.get(status, status)
+        
+        module_map = {
+            "IDEA": "灵感风暴",
+            "KNOWLEDGE": "知识库", 
+            "CHARACTERS": "角色管理", 
+            "BOOKS": "书籍管理", 
+            "WRITER": "写作终端", 
+            "SETTINGS": "系统设置"
+        }
+        module_cn = module_map.get(module, module)
+
+        if isinstance(details, (dict, list)):
+            try: details = json.dumps(details, ensure_ascii=False)
+            except: details = str(details)
+            
+        row = [timestamp, session_id, module_cn, category, action, status_cn, details]
+        
+        with _log_lock:
+            file_exists = os.path.exists(SYSTEM_LOG_PATH)
+            with open(SYSTEM_LOG_PATH, mode='a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                if not file_exists or os.path.getsize(SYSTEM_LOG_PATH) == 0:
+                    writer.writerow(['时间', '会话ID', '模块', '类别', '操作', '状态', '详情']) 
+                writer.writerow(row)
+    except Exception as e:
+        print(f"❌ 审计日志写入失败: {e}")
+
+# ==============================================================================
+# 🔥 新增：自定义模型解析器 (与 Books/Characters 模块保持一致)
+# ==============================================================================
+def _resolve_ai_client(engine, assigned_key):
+    """
+    智能解析客户端：支持原生模型 + 自定义模型(CUSTOM::)
+    """
+    # 1. 拦截自定义模型
+    if assigned_key and str(assigned_key).startswith("CUSTOM::"):
+        try:
+            # 提取真实名称
+            target_name = assigned_key.split("::", 1)[1]
+            
+            # 从数据库读取配置
+            settings = engine.get_config_db("ai_settings", {})
+            custom_list = settings.get("custom_model_list", [])
+            
+            # 查找匹配项
+            for m in custom_list:
+                if m.get("name") == target_name:
+                    api_key = m.get("key")
+                    base_url = m.get("base")
+                    model_id = m.get("api_model")
+                    
+                    if not api_key or not base_url:
+                        return None, None, None
+                        
+                    # 实例化 OpenAI (使用 logic 中导入的类)
+                    client = OpenAI(api_key=api_key, base_url=base_url)
+                    return client, model_id, "custom"
+            
+            print(f"❌ 未找到自定义模型配置: {target_name}")
+            return None, None, None
+        except Exception as e:
+            print(f"❌ 自定义模型解析失败: {e}")
+            return None, None, None
+
+    # 2. 原生模型走默认逻辑
+    return engine.get_client(assigned_key)
 
 # --- 0. 基础配置 ---
 THEME_COLOR = "#2e7d32" 
@@ -139,19 +238,22 @@ def render_idea(engine):
         start_gen = st.button("✨ 立即生成灵感", type="primary", use_container_width=True)
     
     if start_gen:
-        client, model_name, model_key = engine.get_client(assigned_model_key_idea)
+        # 🔥 修复：使用支持自定义模型的解析器
+        # 原代码: client, model_name, model_key = engine.get_client(assigned_model_key_idea)
+        client, model_name, model_key = _resolve_ai_client(engine, assigned_model_key_idea)
         
         if not client:
              st.error(f"❌ 无法初始化 AI 客户端。")
-             st.info(f"当前功能【灵感生成】分配的模型是：**{model_key}**。")
+             st.info(f"当前功能【灵感生成】分配的模型 Key 是：**{assigned_model_key_idea}**。")
              st.info(f"请前往【系统设置】->【模型配置】检查该模型对应的厂商 API Key 是否已填写并保存。")
-             log_operation("AI生成失败", "Key 未配置")
+             
+             # 🔥 审计：生成失败
+             log_audit_event("AI创意", "生成失败", {"原因": "Key 未配置"}, status="ERROR")
              st.stop()
         
         if not keywords.strip():
              st.warning("⚠️ 请输入一些关键词或描述，给 AI 一点提示吧！")
-             log_operation("输入错误", "灵感点子生成中断: 关键词为空")
-             st.stop()
+             return
         else:
             # 确保字段不为空 (防御性处理)
             final_type = gen_type if gen_type else "未指定"
@@ -169,7 +271,13 @@ def render_idea(engine):
             请直接输出内容，格式清晰，便于阅读。
             """
             
-            log_operation("AI生成", f"开始生成灵感: Type={final_type}, Genre={final_genre}")
+            # 🔥 审计：生成启动
+            log_audit_event("AI创意", "启动生成", {
+                "目标": final_type, 
+                "流派": final_genre, 
+                "基调": final_tone,
+                "关键词": keywords[:50] + "..."
+            })
 
             with st.spinner(f"AI ({model_name}) 正在进行头脑风暴..."):
                 try:
@@ -183,13 +291,19 @@ def render_idea(engine):
                             "tone": final_tone
                         }
                         st.success("灵感生成成功！")
-                        log_operation("AI生成成功", f"灵感生成完成 (长度:{len(result)})")
+                        
+                        # 🔥 审计：生成成功
+                        log_audit_event("AI创意", "生成完成", {"内容长度": len(result)})
+                        
                     else:
                         st.error(f"生成失败: {result}")
-                        log_operation("AI生成失败", f"API返回错误: {result}")
+                        
+                        # 🔥 审计：生成失败
+                        log_audit_event("AI创意", "生成失败", {"API错误": str(result)}, status="ERROR")
+                        
                 except Exception as e:
                     st.error(f"发生异常: {e}")
-                    log_operation("系统异常", f"灵感生成抛出异常: {str(e)}")
+                    log_audit_event("AI创意", "生成异常", {"错误": str(e)}, status="ERROR")
 
     # --- 3. 结果编辑与保存区 (版本化存储) ---
     if "last_idea_result" in st.session_state:
@@ -231,14 +345,15 @@ def render_idea(engine):
                     with open(filepath, "w", encoding="utf-8") as f:
                         f.write(file_content)
                         
-                    log_operation("数据保存", f"保存灵感文档: {filename}")
+                    # 🔥 审计：保存文档
+                    log_audit_event("档案管理", "保存文档", {"文件名": filename})
                     
                     st.toast(f"✅ 已保存版本：{filename}")
                     time.sleep(1)
                     st.rerun()
                 except Exception as e:
                     st.error(f"保存失败: {e}")
-                    log_operation("保存失败", f"保存灵感文档出错: {str(e)}")
+                    log_audit_event("档案管理", "保存失败", {"错误": str(e)}, status="ERROR")
 
     # --- 4. 灵感档案柜 (历史记录) ---
     st.markdown("### 📂 灵感档案柜")
@@ -262,13 +377,15 @@ def render_idea(engine):
                     if st.button("🗑️ 删除", key=f"del_{f}", type="secondary", use_container_width=True):
                         try:
                             os.remove(os.path.join(IDEA_DIR, f))
-                            log_operation("删除数据", f"删除灵感文档: {f}")
+                            
+                            # 🔥 审计：删除文档
+                            log_audit_event("档案管理", "删除文档", {"文件名": f}, status="WARNING")
+                            
                             st.toast(f"已删除: {f}")
                             time.sleep(0.5)
                             st.rerun()
                         except Exception as e:
                             st.error(f"删除失败: {e}")
-                            log_operation("删除失败", f"删除文档出错: {str(e)}")
                     
                     if st.button("✏️ 加载", key=f"load_{f}", help="加载此文档内容到上方编辑台", use_container_width=True):
                         try:
@@ -277,13 +394,14 @@ def render_idea(engine):
                                 st.session_state["last_idea_result"] = content
                                 st.session_state["last_idea_meta"] = {"type": "加载文档", "genre": "-", "tone": "-"}
                                 
-                                log_operation("加载数据", f"加载灵感文档到编辑台: {f}")
+                                # 🔥 审计：加载文档
+                                log_audit_event("档案管理", "加载文档", {"文件名": f})
                                 
                                 st.toast("已加载到上方编辑台")
                                 st.rerun()
                         except Exception as e:
                             st.error("加载失败")
-                            log_operation("加载失败", f"读取文档出错: {str(e)}")
+                            log_audit_event("档案管理", "加载失败", {"错误": str(e)}, status="ERROR")
 
                 with col_content:
                     try:

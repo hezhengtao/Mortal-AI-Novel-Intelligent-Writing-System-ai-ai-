@@ -7,16 +7,27 @@ import json
 import pandas as pd
 import os 
 import re 
+import csv
+import uuid
+import threading
+from datetime import datetime
 from utils import (
     render_header, 
     update_chapter_title_db, 
     update_chapter_summary_db,
     resequence_chapters,
-    log_operation,      
     ensure_log_file     
 )
 from views.books import record_token_usage, get_beijing_time
 from logic import FEATURE_MODELS, MODEL_MAPPING
+
+# 🔥 核心修复：引入 OpenAI 用于手动构建客户端
+try:
+    from openai import OpenAI
+except ImportError:
+    class OpenAI: 
+        def __init__(self, **kwargs): 
+            pass
 
 # ==============================================================================
 # 🛠️ Helpers & Configuration
@@ -27,23 +38,60 @@ try:
 except ImportError:
     DATA_DIR = "data"
 
-# 🔥 [常量] API 最大输出 Token 安全阈值对应的字数
-# 假设 multiplier 为 1.8，8192 / 1.8 ≈ 4500。为了安全，限制在 4000-4200。
 MAX_SAFE_WORD_COUNT = 4096 
 
+# ==============================================================================
+# 🛡️ 严格审计日志系统 (Writer 集成版)
+# ==============================================================================
+
+SYSTEM_LOG_PATH = os.path.join(DATA_DIR, "logs", "system_audit.csv")
+_log_lock = threading.Lock()
+
+def get_session_id():
+    if "session_trace_id" not in st.session_state:
+        st.session_state.session_trace_id = str(uuid.uuid4())[:8]
+    return st.session_state.session_trace_id
+
+def log_audit_event(category, action, details, status="SUCCESS", module="WRITER"):
+    try:
+        os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_id = get_session_id()
+        
+        status_map = {"SUCCESS": "成功", "WARNING": "警告", "ERROR": "错误"}
+        status_cn = status_map.get(status, status)
+        
+        module_map = {"WRITER": "写作终端", "SETTINGS": "系统设置"}
+        module_cn = module_map.get(module, module)
+
+        if isinstance(details, (dict, list)):
+            try: details = json.dumps(details, ensure_ascii=False)
+            except: details = str(details)
+            
+        row = [timestamp, session_id, module_cn, category, action, status_cn, details]
+        
+        with _log_lock:
+            file_exists = os.path.exists(SYSTEM_LOG_PATH)
+            with open(SYSTEM_LOG_PATH, mode='a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                if not file_exists or os.path.getsize(SYSTEM_LOG_PATH) == 0:
+                    writer.writerow(['时间', '会话ID', '模块', '类别', '操作', '状态', '详情']) 
+                writer.writerow(row)
+    except Exception as e:
+        print(f"❌ 审计日志写入失败: {e}")
+
+# ==============================================================================
+
 def delete_book_cache(book_id, book_title):
-    """删除书籍的缓存文件"""
     try:
         safe_title = re.sub(r'[\\/*?:"<>|]', "", str(book_title)).strip()
         cache_file = os.path.join(DATA_DIR, "exports", f"{book_id}_{safe_title}.txt")
         if os.path.exists(cache_file):
             os.remove(cache_file)
-            print(f"✅ 已删除缓存文件: {cache_file}")
     except Exception as e:
         print(f"⚠️ 删除缓存文件失败: {e}")
 
 def force_update_book_time(db_mgr, book_id):
-    """强制使用北京时间更新书籍的 updated_at 字段，并删除缓存文件"""
     try:
         current_time = get_beijing_time()
         db_mgr.execute("UPDATE books SET updated_at=? WHERE id=?", (current_time, book_id))
@@ -63,7 +111,6 @@ def get_safe_model_default(feature_key, hard_coded_default):
     return hard_coded_default
 
 def safe_get_content(chunk):
-    """Safe chunk extraction"""
     try:
         if isinstance(chunk, str): return chunk
         if hasattr(chunk, 'choices') and chunk.choices:
@@ -98,8 +145,7 @@ def _update_chapter_title_db_logged(chap_id, new_title_key):
         db_mgr.execute("UPDATE chapters SET title=? WHERE id=?", (new_title, chap_id))
         force_update_book_time(db_mgr, st.session_state.current_book_id)
         st.session_state.chapter_title_cache[chap_id] = new_title
-        ensure_log_file()
-        log_operation("章节管理", f"重命名章节 ID:{chap_id} 为 {new_title}")
+        log_audit_event("章节管理", "重命名章节", {"章节ID": chap_id, "新标题": new_title})
         st.session_state.rerun_flag = True
 
 def _update_chapter_summary_db_logged(chap_id, new_summary_key):
@@ -107,41 +153,50 @@ def _update_chapter_summary_db_logged(chap_id, new_summary_key):
     db_mgr = st.session_state.db
     db_mgr.execute("UPDATE chapters SET summary=? WHERE id=?", (new_summary, chap_id))
     force_update_book_time(db_mgr, st.session_state.current_book_id)
-    ensure_log_file()
-    log_operation("章节管理", f"更新章节大纲 ID:{chap_id}")
+    log_audit_event("章节管理", "更新大纲", {"章节ID": chap_id, "大纲长度": len(new_summary)})
     st.session_state.rerun_flag = True
 
 # ==============================================================================
-# 🧠 Logic: Plot Continuity Enhancement System (🔥 增强模块)
+# 🔥 [NEW] 直连数据库读取配置 (绕过 Engine 缓存)
+# ==============================================================================
+def get_config_direct_from_db(key_name, default_value=None):
+    """直接查询 SQLite，确保配置百分百实时"""
+    try:
+        db_mgr = st.session_state.db
+        rows = db_mgr.query("SELECT value FROM configs WHERE key=?", (key_name,))
+        if rows and len(rows) > 0:
+            val_str = rows[0]['value']
+            try:
+                return json.loads(val_str)
+            except:
+                return val_str
+    except Exception as e:
+        print(f"Direct Config Read Error: {e}")
+    return default_value
+
+# ==============================================================================
+# 🧠 Logic: Plot Continuity
 # ==============================================================================
 
 class PlotContinuityTracker:
-    """追踪剧情节点，确保情节连续"""
     def __init__(self, db_mgr, book_id):
         self.db_mgr = db_mgr
         self.book_id = book_id
         
     def extract_plot_nodes(self, chapter_content, chapter_title=""):
-        """从章节内容提取关键剧情节点"""
         if not chapter_content: return []
-        
-        # 1. 提取时间线节点
         time_patterns = [
             r'([一二三四五六七八九十]+天后)', r'([0-9]+天后)',
             r'次日', r'第二天', r'第三天', r'一周后', r'一个月后',
             r'清晨', r'正午', r'傍晚', r'深夜',
             r'春天', r'夏天', r'秋天', r'冬天'
         ]
-        
-        # 2. 提取地点场景节点
         location_patterns = [
             r'来到([^，。！？]{2,10})', r'进入([^，。！？]{2,10})',
             r'在([^，。！？]{2,10})里', r'从([^，。！？]{2,10})出发',
             r'抵达([^，。！？]{2,10})', r'离开([^，。！？]{2,10})'
         ]
-        
-        # 3. 提取关键事件节点
-        content = chapter_content[:2000] # 只分析前2000字避免过长
+        content = chapter_content[:2000]
         event_keywords = ["突然", "就在这时", "没想到", "意外的是", "终于", "决定", "开始", "结束"]
         events = []
         for keyword in event_keywords:
@@ -152,7 +207,6 @@ class PlotContinuityTracker:
                     end = min(len(content), pos + 100)
                     context = content[start:end]
                     events.append(f"事件: {context.strip()}")
-        
         return {
             'chapter': chapter_title,
             'time_markers': self._extract_by_patterns(content, time_patterns),
@@ -186,65 +240,44 @@ class PlotContinuityTracker:
         return status_changes
     
     def get_chapter_continuity_report(self, prev_chap_id, current_chap_id):
-        """生成章节间连贯性报告"""
         try:
             prev_chap = self.db_mgr.query("SELECT id, title, content FROM chapters WHERE id=?", (prev_chap_id,))
             curr_chap = self.db_mgr.query("SELECT id, title, content FROM chapters WHERE id=?", (current_chap_id,))
-            
             if not prev_chap or not curr_chap: return "无法获取章节信息"
-            
             prev_data = prev_chap[0]
             curr_data = curr_chap[0]
-            
-            # 修复：sqlite3.Row 使用 ['key'] 而不是 .get()
             prev_content = prev_data['content'] or ""
             prev_end = prev_content[-500:] if len(prev_content) > 500 else prev_content
-            
             curr_content = curr_data['content'] or ""
             curr_start = curr_content[:500] if len(curr_content) > 500 else curr_content
-            
             prev_nodes = self.extract_plot_nodes(prev_end, f"《{prev_data['title']}》结尾")
             curr_nodes = self.extract_plot_nodes(curr_start, f"《{curr_data['title']}》开头")
-            
             report = []
             report.append(f"## 📊 章节连贯性分析报告")
             report.append(f"**前一章**: {prev_data['title']} → **当前章**: {curr_data['title']}")
             report.append("---")
-            
             if prev_nodes.get('time_markers') and curr_nodes.get('time_markers'):
                 report.append(f"⏰ **时间线检查**:")
                 report.append(f"- 前一章时间: {', '.join(prev_nodes['time_markers'][:3])}")
                 report.append(f"- 当前章时间: {', '.join(curr_nodes['time_markers'][:3])}")
-            
             if prev_nodes.get('locations') and curr_nodes.get('locations'):
                 report.append(f"📍 **场景检查**:")
                 report.append(f"- 前一章地点: {', '.join(prev_nodes['locations'][:3])}")
                 report.append(f"- 当前章地点: {', '.join(curr_nodes['locations'][:3])}")
-                prev_locs = set(prev_nodes['locations'])
-                curr_locs = set(curr_nodes['locations'])
-                if prev_locs and curr_locs and not prev_locs.intersection(curr_locs):
-                    report.append(f"⚠️ **警告**: 场景发生突变，没有明显的过渡！")
-            
             if prev_nodes.get('events') and curr_nodes.get('events'):
                 report.append(f"🎭 **事件连续性**:")
                 report.append(f"- 前一章结尾事件: {prev_nodes['events'][0] if prev_nodes['events'] else '无'}")
                 report.append(f"- 当前章开头事件: {curr_nodes['events'][0] if curr_nodes['events'] else '无'}")
-            
-            # 结尾-开头直接对比
             report.append(f"📖 **直接文本对比**:")
             report.append(f"```\n前一章结尾: {prev_end[-100:].replace(chr(10), ' ')}\n当前章开头: {curr_start[:100].replace(chr(10), ' ')}\n```")
-            
             return "\n".join(report)
         except Exception as e:
             return f"分析出错: {str(e)}"
 
-# 🔥 [新增] 剧情动量分析
 def analyze_plot_momentum(content):
-    """分析前一章的剧情动量（未完成的事件、对话、冲突）"""
     if not content or len(content) < 200: return None
     last_paragraphs = content.split('\n\n')[-3:]
     momentum_points = []
-    
     for para in last_paragraphs:
         para = para.strip()
         if not para: continue
@@ -260,12 +293,10 @@ def analyze_plot_momentum(content):
             if word in para:
                 momentum_points.append("存在未解答的疑问或悬念")
                 break
-    
     if momentum_points:
         return "⚠️ **前一章遗留的剧情动量**: " + " | ".join(set(momentum_points[:3]))
     return None
 
-# 🔥 [新增] 智能摘要生成
 def generate_smart_summary(content, title):
     if not content or len(content) < 300: return "内容过短，无法提取关键剧情"
     sentences = []
@@ -273,7 +304,6 @@ def generate_smart_summary(content, title):
         if delimiter in content:
             parts = content.split(delimiter)
             sentences.extend([s.strip() + delimiter for s in parts if len(s.strip()) > 20])
-    
     key_indicators = ["突然", "就在这时", "没想到", "决定", "开始", "结束", "发现", "意识到", "承诺", "约定"]
     key_sentences = []
     for sentence in sentences[-10:]:
@@ -282,13 +312,11 @@ def generate_smart_summary(content, title):
                 key_sentences.append(sentence)
                 break
         if len(key_sentences) >= 3: break
-    
     if key_sentences: return "\n".join(key_sentences[:3])
     else:
         last_sentences = sentences[-3:] if len(sentences) >= 3 else sentences
         return "\n".join(last_sentences)
 
-# 🔥 [新增] 提取叙事性结尾
 def extract_narrative_ending(content):
     if not content: return None
     paragraphs = content.split('\n\n')
@@ -299,7 +327,6 @@ def extract_narrative_ending(content):
             if para[-1] in ['。', '！', '？', '.', '!', '?', '」']: return para
     return content[-300:] if len(content) > 300 else content
 
-# 🔥 [新增] 生成衔接建议
 def generate_transition_suggestion(prev_content):
     if not prev_content: return "从故事的自然起点开始"
     last_part = prev_content[-200:] if len(prev_content) > 200 else prev_content
@@ -310,7 +337,6 @@ def generate_transition_suggestion(prev_content):
     elif "突然" in last_part or "意外" in last_part: return "建议从突发事件的结果或应对开始"
     else: return "建议从时间推移后的合理延续开始"
 
-# 🔥 [新增] 获取当前章节已出现的人物列表
 def get_current_chapter_characters(content):
     if not content or len(content) < 100: return set()
     characters = set()
@@ -329,14 +355,12 @@ def get_current_chapter_characters(content):
                 for name in match:
                     if name and len(name) >= 2: characters.add(name.strip())
             elif match: characters.add(match.strip())
-            
     possessive_pattern = r'([^,，。！？!?\s]{2,6}?)的[^的]{1,8}'
     matches = re.findall(possessive_pattern, content)
     for name in matches:
         if len(name) >= 2: characters.add(name.strip())
     return characters
 
-# 🔥 [新增] 获取上一章的人物登场记录
 def get_previous_chapter_characters(db_mgr, book_id, current_chap_id):
     try:
         all_chaps = db_mgr.query("""
@@ -348,26 +372,21 @@ def get_previous_chapter_characters(db_mgr, book_id, current_chap_id):
             ORDER BY p.sort_order, v.sort_order, c.sort_order
         """, (book_id,))
         if not all_chaps: return set()
-        
         current_idx = -1
         for idx, chap in enumerate(all_chaps):
             if chap['id'] == current_chap_id:
                 current_idx = idx; break
-        
         prev_characters = set()
-        for i in range(1, 3): # 检查前两章
+        for i in range(1, 3): 
             check_idx = current_idx - i
             if check_idx >= 0:
-                # 修复：Row object has no get
                 prev_content = all_chaps[check_idx]['content'] or ""
                 if prev_content:
                     prev_characters.update(get_current_chapter_characters(prev_content))
         return prev_characters
     except Exception as e:
-        print(f"获取前章人物失败: {e}")
         return set()
 
-# 🔥 [增强] 沉浸写作的提示词
 def get_enhanced_writing_prompt(context, outline, target_words):
     prompt_parts = []
     prompt_parts.append("【小说创作AI - 智能剧情衔接模式】")
@@ -393,11 +412,10 @@ def get_enhanced_writing_prompt(context, outline, target_words):
     prompt_parts.append("- 已登场人物不应重新介绍")
     prompt_parts.append("- 章节结尾要为下一章埋下合理伏笔")
     prompt_parts.append("- 保持紧张感与阅读流畅性")
-    
     return "\n".join(prompt_parts)
 
 # ==============================================================================
-# 🧠 Context Manager (🔥 增强连贯性逻辑)
+# 🧠 Context Manager
 # ==============================================================================
 
 def get_next_chapter_context(db_mgr, book_id, current_chap_id=None):
@@ -410,37 +428,28 @@ def get_next_chapter_context(db_mgr, book_id, current_chap_id=None):
             WHERE p.book_id = ?
             ORDER BY p.sort_order, v.sort_order, c.sort_order
         """, (book_id,))
-        
         if not all_chaps: return ""
         curr_idx = -1
         if current_chap_id:
             for idx, item in enumerate(all_chaps):
                 if item['id'] == current_chap_id:
                     curr_idx = idx; break
-        
         if curr_idx != -1 and curr_idx + 1 < len(all_chaps):
             next_chap = all_chaps[curr_idx + 1]
-            # 修复：sqlite3.Row object has no attribute 'get'
             summary = next_chap['summary'] if 'summary' in next_chap.keys() else ""
             if summary:
                 return f"【后续剧情提示】下一章《{next_chap['title']}》的规划：{summary}"
-    except Exception as e:
-        print(f"Next chapter context error: {e}")
+    except Exception as e: pass
     return ""
 
-def get_full_context(db_mgr, book_id, current_chap_id=None):
-    """🔥 [增强版] 获取完整的上下文信息，集成智能衔接"""
+def get_full_context(db_mgr, book_id, current_chap_id=None, current_outline=""):
     context_parts = []
-    
-    # 1. 严格指令
     context_parts.append("【重要写作要求 - 必须严格遵守】")
     context_parts.append("1. **强制衔接要求**: 必须与上一章结尾自然衔接，时间、地点、人物状态必须连续")
     context_parts.append("2. **人物登场管理**: 如果人物在前一章已经登场，本章不应再次介绍登场，应直接延续其行动")
     context_parts.append("3. **避免重复描述**: 相同的人物特征、能力在前文已描述过的，本章不应重复描述")
     context_parts.append("4. **逻辑连续性**: 剧情发展必须有合理的因果链条，避免突兀跳跃")
     context_parts.append("5. **章节过渡**: 章节结尾要为下一章提供自然的过渡，可以设置悬念或阶段总结")
-    
-    # 2. 已登场人物追踪
     if current_chap_id:
         prev_characters = get_previous_chapter_characters(db_mgr, book_id, current_chap_id)
         if prev_characters:
@@ -448,7 +457,6 @@ def get_full_context(db_mgr, book_id, current_chap_id=None):
             context_parts.append(", ".join(sorted(list(prev_characters))))
             context_parts.append("如果需要在对话或行动中提及这些人物，请直接使用，无需再次介绍背景。")
             
-    # 3. 智能剧情衔接分析
     try:
         all_chaps = db_mgr.query("""
             SELECT c.id, c.title, c.content, c.summary 
@@ -458,92 +466,80 @@ def get_full_context(db_mgr, book_id, current_chap_id=None):
             WHERE p.book_id = ?
             ORDER BY p.sort_order, v.sort_order, c.sort_order
         """, (book_id,))
-        
         curr_idx = -1
         if current_chap_id:
             for idx, chap in enumerate(all_chaps):
                 if chap['id'] == current_chap_id:
                     curr_idx = idx; break
-        
         if curr_idx > 0:
             prev_chap = all_chaps[curr_idx - 1]
-            # 修复：Row object has no get
             prev_content = prev_chap['content'] or ""
             if prev_content:
                 momentum_analysis = analyze_plot_momentum(prev_content)
                 if momentum_analysis:
                     context_parts.append(f"【剧情动量分析 - 必须承接】")
                     context_parts.append(momentum_analysis)
-    except Exception as e: print(f"Context analysis error: {e}")
-    
-    # 4. 世界观
+    except Exception as e: pass
     try:
         settings = db_mgr.query("SELECT content FROM plots WHERE book_id=? AND status LIKE 'Setting_%'", (book_id,))
         if settings:
             s_text = "\n".join([f"- {s['content']}" for s in settings])
             context_parts.append(f"【世界观与设定】\n{s_text}")
     except: pass
-    
-    # 5. 角色
     try:
-        chars = db_mgr.query("SELECT name, role, gender, desc, cheat_ability, power_level, debts_and_feuds FROM characters WHERE book_id=? AND is_major=1", (book_id,))
-        if chars:
-            c_list = []
-            for c in chars:
-                info = f"{c['name']}({c['role']}): {c['desc']}"
-                if c['cheat_ability']: info += f" | 金手指: {c['cheat_ability']}"
-                c_list.append(info)
-            context_parts.append(f"【核心角色档案】\n" + "\n".join(c_list))
-    except: pass
-    
-    # 6. 前情回顾 - 🔥 [增强版]
+        all_chars = db_mgr.query("SELECT name, role, gender, desc, cheat_ability, is_major FROM characters WHERE book_id=?", (book_id,))
+        if all_chars:
+            relevant_chars = []
+            seen_names = set()
+            for c in all_chars:
+                should_include = False
+                c_name = c['name'].strip()
+                if c['is_major']: should_include = True
+                elif current_outline and c_name in current_outline: should_include = True
+                if should_include and c_name not in seen_names:
+                    gender_str = c['gender'] if c['gender'] else "未知性别"
+                    info = f"{c_name} ({gender_str} | {c['role']}): {c['desc']}"
+                    if c['cheat_ability']: info += f" | 金手指: {c['cheat_ability']}"
+                    relevant_chars.append(info)
+                    seen_names.add(c_name)
+            if relevant_chars:
+                context_parts.append(f"【本章相关角色档案】\n" + "\n".join(relevant_chars))
+    except Exception as e: pass
     try:
         target_idx = curr_idx if curr_idx != -1 else len(all_chaps)
-        
         if target_idx == 0:
             context_parts.append("【前情回顾】\n这是故事的开篇章节，请建立世界观和主要人物。")
         else:
             start_idx = max(0, target_idx - 3)
             prev_chaps = all_chaps[start_idx:target_idx]
-            
             if prev_chaps:
                 context_parts.append(f"【智能前情提要】")
                 for i, pc in enumerate(prev_chaps):
                     is_last_prev = (i == len(prev_chaps) - 1)
-                    
-                    if is_last_prev: # 上一章
-                        # 修复：Row object has no get
+                    if is_last_prev: 
                         pc_content = pc['content'] or ""
                         smart_summary = generate_smart_summary(pc_content, pc['title'])
                         context_parts.append(f"📖 **上一章《{pc['title']}》关键剧情**:")
                         context_parts.append(smart_summary)
-                        
                         raw_cont = pc_content
                         if raw_cont:
                             end_part = raw_cont[-800:] if len(raw_cont) > 800 else raw_cont
                             paragraphs = end_part.split('\n\n')
                             last_paragraphs = paragraphs[-3:] if len(paragraphs) > 3 else paragraphs
                             last_content = "\n\n".join([p.strip() for p in last_paragraphs if p.strip()])
-                            
                             if last_content:
                                 context_parts.append(f"🔚 **上一章《{pc['title']}》结尾实录（必须从这继续）**:\n{last_content}")
                                 transition_suggestion = generate_transition_suggestion(pc_content)
                                 context_parts.append(f"💡 **智能衔接建议**: {transition_suggestion}")
                         else:
-                            # 修复：Row object has no get
                             context_parts.append(f"📝 上一章《{pc['title']}》概要: {pc['summary'] or '暂无详细内容'}")
-                    
-                    else: # 更早的章节
-                         # 修复：Row object has no get
+                    else:
                         summary = pc['summary'] if pc['summary'] else ""
                         context_parts.append(f"📝 《{pc['title']}》: {summary[:100]}...")
-    except Exception as e: print(f"Context Error: {e}")
-
-    # 7. 下一章上下文
+    except Exception as e: pass
     next_context = get_next_chapter_context(db_mgr, book_id, current_chap_id)
     if next_context:
         context_parts.append(next_context)
-
     return "\n\n".join(context_parts)
 
 # ==============================================================================
@@ -557,22 +553,16 @@ def dialog_save_chapter_content(db_mgr, chapter_id, new_content, book_id, chapte
     st.markdown(f"### 正在保存：{chapter_title}")
     st.metric(label="当前文档字数", value=f"{len(new_content)}", delta="准备写入数据库", delta_color="off")
     st.divider()
-    st.warning("⚠️ 此操作将覆盖数据库中的原有内容，确定要继续吗？")
-    st.markdown("<div style='margin-bottom: 15px;'></div>", unsafe_allow_html=True)
     col_cancel, col_confirm = st.columns([1, 1], gap="medium")
     with col_cancel:
-        # 🔥 修改: use_container_width -> width="stretch"
         if st.button("🚫 取消", type="secondary", width="stretch"): st.rerun()
     with col_confirm:
-        # 🔥 修改: use_container_width -> width="stretch"
         if st.button("💾 确认覆盖", type="primary", width="stretch"):
             try:
                 db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (new_content, chapter_id)) 
                 force_update_book_time(db_mgr, book_id)
-                ensure_log_file()
-                log_operation("更新章节", f"保存正文: {chapter_title}")
-                st.session_state.rerun_flag = True
-                st.toast("✅ 已保存", icon="💾"); time.sleep(0.5); st.rerun()
+                log_audit_event("内容编辑", "保存正文", {"章节": chapter_title, "ID": chapter_id, "字数": len(new_content)})
+                st.session_state.rerun_flag = True; st.toast("✅ 已保存"); time.sleep(0.5); st.rerun()
             except Exception as e: st.error(f"保存失败: {e}")
 
 @dialog_decorator("➕ 新建")
@@ -592,13 +582,11 @@ def dialog_add_node(type_label, parent_id, book_id=None):
             st.session_state.expanded_parts.add(parent_id)
         elif type_label == "章":
             mx = db_mgr.query("SELECT MAX(sort_order) as m FROM chapters WHERE volume_id=?", (parent_id,))[0]['m'] or 0
-            cid = db_mgr.execute("INSERT INTO chapters (volume_id, title, summary, content, sort_order) VALUES (?,?,?,?,?)",
-                           (parent_id, name_input, "", "", mx+1))
+            cid = db_mgr.execute("INSERT INTO chapters (volume_id, title, summary, content, sort_order) VALUES (?,?,?,?,?)", (parent_id, name_input, "", "", mx+1))
             st.session_state.current_chapter_id = cid
             if 'expanded_volumes' not in st.session_state: st.session_state.expanded_volumes = set()
             st.session_state.expanded_volumes.add(parent_id)
-        ensure_log_file()
-        log_operation("结构管理", f"新建{type_label}: {name_input}")
+        log_audit_event("结构管理", f"新建{type_label}", {"名称": name_input, "父级ID": parent_id})
         st.session_state.rerun_flag = True; st.rerun()
 
 @dialog_decorator("⚙️ 管理")
@@ -610,13 +598,11 @@ def dialog_manage_node(type_label, node_id, current_name):
         db_mgr = st.session_state.db
         table = "parts" if type_label == "篇" else "volumes"
         db_mgr.execute(f"UPDATE {table} SET name=? WHERE id=?", (new_name, node_id))
-        log_operation("结构管理", f"重命名{type_label}: {current_name} -> {new_name}")
         st.rerun()
     if c2.button("🗑️ 删除", type="secondary"):
         db_mgr = st.session_state.db
         table = "parts" if type_label == "篇" else "volumes"
         db_mgr.execute(f"DELETE FROM {table} WHERE id=?", (node_id,))
-        log_operation("结构管理", f"删除{type_label}: {current_name}")
         st.rerun()
 
 # ==============================================================================
@@ -631,17 +617,14 @@ def render_explorer_node_part(db_mgr, part, current_book_id):
     if 'expanded_parts' not in st.session_state: st.session_state.expanded_parts = set()
     is_expanded = part['id'] in st.session_state.expanded_parts
     icon = "📂" if not is_expanded else "📖"
-    # 🔥 修改: use_container_width -> width="stretch"
     if st.button(f"{icon} {part['name']}", key=f"p_btn_{part['id']}", width="stretch"):
         toggle_state('expanded_parts', part['id']); st.rerun()
     if is_expanded:
         st.markdown("""<div style="margin-top: -12px; margin-bottom: 5px;"></div>""", unsafe_allow_html=True)
         c_i, c_act1, c_act2 = st.columns([0.1, 1, 1])
         with c_act1:
-            # 🔥 修改: use_container_width -> width="stretch"
             if st.button("➕ 加卷", key=f"add_v_{part['id']}", width="stretch"): dialog_add_node("卷", part['id'])
         with c_act2:
-            # 🔥 修改: use_container_width -> width="stretch"
             if st.button("⚙️ 管理", key=f"mng_p_{part['id']}", width="stretch"): dialog_manage_node("篇", part['id'], part['name'])
         vols = db_mgr.query("SELECT id, name, part_id FROM volumes WHERE part_id=? ORDER BY sort_order", (part['id'],))
         if not vols: st.markdown("<div style='padding-left: 15px; color: gray; font-size: 12px; margin-bottom: 10px;'>└─ (暂无卷)</div>", unsafe_allow_html=True)
@@ -655,17 +638,14 @@ def render_explorer_node_volume(db_mgr, vol):
     icon = "📁" if not is_expanded else "📂"
     c_indent, c_main = st.columns([0.2, 5.8])
     with c_main:
-        # 🔥 修改: use_container_width -> width="stretch"
         if st.button(f"{icon} {vol['name']}", key=f"v_btn_{vol['id']}", width="stretch"):
             toggle_state('expanded_volumes', vol['id']); st.rerun()
     if is_expanded:
         st.markdown("""<div style="margin-top: -12px; margin-bottom: 5px;"></div>""", unsafe_allow_html=True)
         c_i, c_act1, c_act2 = st.columns([0.3, 1, 1])
         with c_act1:
-            # 🔥 修改: use_container_width -> width="stretch"
             if st.button("➕ 加章", key=f"add_c_{vol['id']}", width="stretch"): dialog_add_node("章", vol['id'])
         with c_act2:
-            # 🔥 修改: use_container_width -> width="stretch"
             if st.button("⚙️ 管理", key=f"mng_v_{vol['id']}", width="stretch"): dialog_manage_node("卷", vol['id'], vol['name'])
         chaps = db_mgr.query("SELECT id, title FROM chapters WHERE volume_id=? ORDER BY sort_order", (vol['id'],))
         if not chaps: st.markdown("<div style='padding-left: 35px; color: gray; font-size: 12px;'>└─ (暂无章节)</div>", unsafe_allow_html=True)
@@ -676,10 +656,9 @@ def render_explorer_node_volume(db_mgr, vol):
                     is_active = (st.session_state.get('current_chapter_id') == chap['id'])
                     display_title = st.session_state.chapter_title_cache.get(chap['id'], chap['title'])
                     b_type = "primary" if is_active else "secondary"
-                    # 🔥 修改: use_container_width -> width="stretch"
                     if st.button(f"　　{display_title}", key=f"c_{chap['id']}", width="stretch", type=b_type):
                         ensure_log_file()
-                        log_operation("阅读章节", f"切换章节: {display_title} (ID:{chap['id']})")
+                        log_audit_event("阅读行为", "切换章节", {"章节": display_title, "ID": chap['id']})
                         st.session_state.current_chapter_id = chap['id']
                         st.session_state.current_part_id = vol['part_id']
                         st.rerun()
@@ -689,37 +668,30 @@ def render_explorer_node_volume(db_mgr, vol):
 # 🚀 Render Main Logic
 # ==============================================================================
 def render_writer(engine, current_book, current_chapter):
-    # 🔥 检查是否需要强制滚动
     if st.session_state.get("trigger_scroll_to_top"):
-        js_code = """
-        <script>
-            function scrollNode(node) { if (node) { node.scrollTop = 0; node.scrollLeft = 0; } }
-            function forceScroll() {
-                try {
-                    var parent = window.parent.document;
-                    scrollNode(parent.querySelector('[data-testid="stAppViewContainer"]'));
-                    scrollNode(parent.querySelector('section.main'));
-                    scrollNode(parent.documentElement);
-                    scrollNode(parent.body);
-                } catch(e) { console.log("Scroll error:", e); }
-            }
-            for (let i = 0; i < 20; i++) { window.setTimeout(forceScroll, i * 50); }
-        </script>
-        """
-        components.html(js_code, height=0, width=0)
+        components.html("""<script>window.parent.document.querySelector('section.main').scrollTo(0,0);</script>""", height=0)
         st.session_state.trigger_scroll_to_top = False 
         
     db_mgr = st.session_state.db
     _ensure_part_volume_schema(db_mgr)
     if 'generation_running' not in st.session_state: st.session_state.generation_running = False
-    st.session_state.model_assignments = engine.get_config_db("model_assignments", {})
+    
+    # 🔥🔥🔥 强制直连数据库读取配置 🔥🔥🔥
+    st.session_state.model_assignments = get_config_direct_from_db("model_assignments", {})
+    ai_settings = get_config_direct_from_db("ai_settings", {})
+    custom_models = ai_settings.get("custom_model_list", [])
+    
+    def get_custom_model_data(assigned_key):
+        search_name = assigned_key.replace("CUSTOM::", "").replace("CUSTOM:", "").strip()
+        for m in custom_models:
+            if m['name'] == search_name: return m
+        return None
 
     if not current_book:
         st.warning("请先在 [书籍管理] 中选择一本书"); return
         
     render_header("✍️", current_book['title'])
     
-    # 🔥 获取增强版上下文
     full_context_str = get_full_context(db_mgr, current_book['id'], current_chapter['id'] if current_chapter else None)
     
     st.markdown("""
@@ -728,8 +700,10 @@ def render_writer(engine, current_book, current_chapter):
     div[data-testid="column"]:nth-of-type(1) button:hover { background-color: rgba(150, 150, 150, 0.1) !important; color: #3eaf7c !important; } 
     div[data-testid="column"]:nth-of-type(1) button[kind="primary"] { background-color: rgba(62, 175, 124, 0.15) !important; border-left: 3px solid #3eaf7c !important; color: #3eaf7c !important; padding-left: 8px !important; }
     .custom-select-label { font-size: 14px; font-weight: 600; color: #444; margin-bottom: 4px; display: block; }
-    div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { background-color: #fcfcfc; border: 1px solid #ddd; border-radius: 6px; }
     textarea { font-size: 16px !important; line-height: 1.6 !important; font-family: 'PingFang SC', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: #888; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #555; }
     </style>
     """, unsafe_allow_html=True)
     
@@ -741,7 +715,7 @@ def render_writer(engine, current_book, current_chapter):
         idx = list(opts.values()).index(current_book['id']) if current_book['id'] in opts.values() else 0
         sel_title = st.selectbox("当前书籍", list(opts.keys()), index=idx, label_visibility="collapsed", key="write_book_selector")
         if opts[sel_title] != current_book['id']:
-            ensure_log_file(); log_operation("页面跳转", f"切换书籍: {sel_title}")
+            log_audit_event("阅读行为", "切换书籍", {"书籍": sel_title, "ID": opts[sel_title]})
             st.session_state.current_book_id = opts[sel_title]
             st.session_state.current_chapter_id = None; st.session_state.current_part_id = None
             st.rerun()
@@ -749,19 +723,18 @@ def render_writer(engine, current_book, current_chapter):
         c_label, c_add = st.columns([4, 2])
         with c_label: st.caption("🗂️ 目录结构")
         with c_add:
-            # 🔥 修改: use_container_width -> width="stretch"
             if st.button("➕ 新建篇", key="root_add_p_btn", width="stretch"): dialog_add_node("篇", None, current_book['id'])
-        parts = db_mgr.query("SELECT id, name FROM parts WHERE book_id=? ORDER BY sort_order", (current_book['id'],))
-        if not parts: st.info('暂无内容，请点击上方"新建篇"')
-        else:
-            for part in parts: render_explorer_node_part(db_mgr, part, current_book['id'])
+        
+        with st.container(height=700, border=False):
+            parts = db_mgr.query("SELECT id, name FROM parts WHERE book_id=? ORDER BY sort_order", (current_book['id'],))
+            if not parts: st.info('暂无内容，请点击上方"新建篇"')
+            else:
+                for part in parts: render_explorer_node_part(db_mgr, part, current_book['id'])
 
     with col_editor:
         tab_write, tab_outline, tab_assist = st.tabs(["📝 沉浸写作", "🧠 AI 批量生成", "✨ 写作辅助"])
         
-        # ======================================================================
         # TAB 1: 沉浸写作
-        # ======================================================================
         with tab_write:
             if not current_chapter: st.info("👈 请先从左侧选择一个章节。")
             else:
@@ -772,16 +745,36 @@ def render_writer(engine, current_book, current_chapter):
                 current_summary = current_chapter['summary'] or ""
                 outline_key = f"ai_outline_input_{current_chapter['id']}"
                 outline_input = st.text_area("本章大纲/提示词", current_summary, height=80, key=outline_key, 
-                                           placeholder="在此输入剧情简述...",
+                                           placeholder="在此输入剧情简述...（提到的配角会被自动识别并加入上下文）",
                                            on_change=_update_chapter_summary_db_logged, args=(current_chapter['id'], outline_key))
                 
                 c_m, c_l = st.columns([1.2, 1.8]) 
                 with c_m:
                     def_write = get_safe_model_default("write_quick_gen", "DSK_V3")
                     assigned_write = st.session_state.model_assignments.get("write_quick_gen", def_write)
-                    model_display_name = MODEL_MAPPING.get(assigned_write, {}).get('name', assigned_write)
+                    
+                    model_display_name = ""
+                    # 🔥 修复：如果检测到是自定义模型，直接显示其 API Model ID (如 mimo-v2-flash)
+                    if "CUSTOM" in assigned_write:
+                        c_data = get_custom_model_data(assigned_write)
+                        if c_data:
+                            model_display_name = f"🟢 {c_data.get('api_model', 'Unknown')}"
+                        else:
+                            clean_name = assigned_write.replace("CUSTOM::", "").replace("CUSTOM:", "")
+                            model_display_name = f"🟢 {clean_name} (配置未找到)"
+                    elif assigned_write in MODEL_MAPPING:
+                        model_display_name = MODEL_MAPPING[assigned_write].get('name', assigned_write)
+                    else:
+                        model_display_name = assigned_write
+
                     st.caption(f"当前模型: {model_display_name}")
-                    model_pk = assigned_write if assigned_write in MODEL_MAPPING else None
+                    
+                    # 允许自定义模型通过
+                    if assigned_write in MODEL_MAPPING or "CUSTOM" in assigned_write:
+                        model_pk = assigned_write
+                    else:
+                        model_pk = None
+
                 with c_l: 
                     target_k = st.slider("本章预计字数 (k)", 1.0, 10.0, 3.0, 0.1, key="word_slider")
                     target_words_num = int(target_k * 1000)
@@ -790,17 +783,14 @@ def render_writer(engine, current_book, current_chapter):
                 
                 btn_col1, btn_col2 = st.columns(2)
                 with btn_col1:
-                    # 🔥 修改: use_container_width -> width="stretch"
                     btn_gen = st.button("✨ 开始生成", type="secondary", disabled=st.session_state.generation_running, width="stretch")
                 with btn_col2:
-                    # 🔥 修改: use_container_width -> width="stretch"
                     btn_stop = st.button("⏹️ 停止生成", type="secondary", disabled=not st.session_state.generation_running, width="stretch")
 
                 content_key = f"chapter_content_{current_chapter['id']}"
                 if content_key not in st.session_state:
                     st.session_state[content_key] = current_chapter['content'] or ""
 
-                # 🔥 修改: use_container_width -> width="stretch"
                 if st.button("💾 保存当前正文", type="primary", width="stretch"):
                      content_to_save = st.session_state.get(content_key, current_chapter['content'] or "")
                      dialog_save_chapter_content(db_mgr, current_chapter['id'], content_to_save, current_book['id'], current_chapter['title'])
@@ -809,50 +799,70 @@ def render_writer(engine, current_book, current_chapter):
 
                 current_text = st.session_state.get(content_key, "")
                 current_len = len(current_text)
-                if current_len > target_words_num + 1000: len_color = "red"
-                elif current_len < 100: len_color = "orange"
-                else: len_color = "green"
-
+                len_color = "green" if current_len > 100 else "orange"
+                
                 c_head, c_status, c_count = st.columns([1.2, 2.5, 1.3])
-                
-                with c_head: 
-                    st.caption("📖 正文编辑")
-                
+                with c_head: st.caption("📖 正文编辑")
                 ai_status_box = c_status.empty()
-                
-                with c_count: 
-                    st.markdown(f"<div style='text-align:right; font-size:14px; padding-bottom:5px;'>字数: <span style='color:{len_color}; font-weight:bold'>{current_len}</span> / {target_words_num}</div>", unsafe_allow_html=True)
+                with c_count: st.markdown(f"<div style='text-align:right; font-size:14px; padding-bottom:5px;'>字数: <span style='color:{len_color}; font-weight:bold'>{current_len}</span> / {target_words_num}</div>", unsafe_allow_html=True)
 
                 editor_placeholder = st.empty()
                 should_render_editor = True
 
                 if btn_gen and model_pk:
                     should_render_editor = False 
-                    client, m_name, m_key = engine.get_client(model_pk)
-                    if not client: st.error("API Key 未配置")
+                    
+                    # 🔥🔥🔥 核心修复：如果是 Custom 模型，手动构建 Client 绕过 Engine 查找失败的问题
+                    client = None; m_name = ""; m_key = ""
+                    
+                    if "CUSTOM" in model_pk:
+                        c_data = get_custom_model_data(model_pk)
+                        if c_data:
+                            # 直接从数据库读配置，不依赖 engine.get_client
+                            try:
+                                client = OpenAI(api_key=c_data.get('key'), base_url=c_data.get('base'))
+                                m_name = c_data.get('api_model', 'custom')
+                                m_key = c_data.get('key')
+                            except Exception as e:
+                                st.error(f"❌ 客户端创建失败: {e}")
+                        else:
+                            st.error("❌ 自定义模型配置未找到，请检查设置。")
+                    else:
+                        # 标准模型继续走 Engine
+                        client, m_name, m_key = engine.get_client(model_pk)
+
+                    if not client: 
+                        st.error("API Key 未配置或无效")
                     else:
                         db_mgr.execute("UPDATE chapters SET summary=? WHERE id=?", (outline_input, current_chapter['id']))
                         st.session_state.generation_running = True
-                        ensure_log_file(); log_operation("AI生成", f"开始生成: {current_chapter['title']}")
+                        ensure_log_file()
                         
-                        # 🔥 [修复核心]：安全 Token 限制，防止 400 错误
-                        final_prompt = get_enhanced_writing_prompt(full_context_str, outline_input, target_words_num)
+                        # 🔥 审计：AI生成开始
+                        log_audit_event("AI创作", "单章生成启动", {"章节": current_chapter['title'], "模型": m_name, "目标字数": target_words_num})
                         
-                        request_tokens = target_words_num
-                        if request_tokens > MAX_SAFE_WORD_COUNT:
-                             request_tokens = MAX_SAFE_WORD_COUNT
-                             st.toast(f"⚠️ 目标字数过高，已自动限制为 {MAX_SAFE_WORD_COUNT} 以避免 API 报错", icon="🛡️")
+                        # 🔥🔥🔥 智能读取核心调用点：传入 outline_input 以激活配角读取 🔥🔥🔥
+                        full_context_smart = get_full_context(
+                            db_mgr, 
+                            current_book['id'], 
+                            current_chapter['id'], 
+                            current_outline=outline_input
+                        )
+                        
+                        final_prompt = get_enhanced_writing_prompt(full_context_smart, outline_input, target_words_num)
+                        request_tokens = min(target_words_num, MAX_SAFE_WORD_COUNT)
+                        if request_tokens != target_words_num: st.toast(f"⚠️ 自动限制字数为 {MAX_SAFE_WORD_COUNT}", icon="🛡️")
 
-                        hard_stop_limit = int(target_words_num * 1.5)
+                        # 显示纯净的 API ID 用于状态栏
+                        status_model_name = m_name if m_name else "AI"
+                        ai_status_box.markdown(f":blue[⚡ AI 正在码字 ({status_model_name})...] <span style='font-size:12px'>Thinking...</span>", unsafe_allow_html=True)
                         
-                        ai_status_box.markdown(f":blue[⚡ AI 正在码字 ({m_name})...] <span style='font-size:12px'>Thinking...</span>", unsafe_allow_html=True)
-                        
-                        # 使用安全的 request_tokens
+                        # 传入手动构建的 client
                         ok, stream = engine.generate_content_from_outline_ai_stream(current_chapter['id'], final_prompt, current_book, request_tokens, client, m_name, m_key)
                         if ok:
                             buf = ""
-                            full_existing = st.session_state[content_key] or ""
-                            full_existing = full_existing.strip() + "\n" if full_existing else ""
+                            full_existing = (st.session_state[content_key] or "").strip()
+                            full_existing = full_existing + "\n" if full_existing else ""
                             
                             for chunk in stream:
                                 if not st.session_state.generation_running: break
@@ -860,39 +870,31 @@ def render_writer(engine, current_book, current_chapter):
                                 if content_text:
                                     buf += content_text
                                     simulated_content = full_existing + buf
-                                    editor_placeholder.markdown(
-                                        f"""<div style="height: 600px; overflow-y: auto; border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 0.25rem; padding: 1rem; font-family: 'Source Sans Pro', sans-serif; white-space: pre-wrap; background-color: transparent;">{simulated_content}</div>""",
-                                        unsafe_allow_html=True
-                                    )
-                                    if len(buf) > hard_stop_limit:
-                                        st.session_state.generation_running = False
-                                        st.toast(f"⚠️ 达到字数上限保护，已停止", icon="🛑"); break
-                                        
+                                    editor_placeholder.markdown(f"""<div style="height: 600px; overflow-y: auto; border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 0.25rem; padding: 1rem; font-family: 'Source Sans Pro', sans-serif; white-space: pre-wrap; background-color: transparent;">{simulated_content}</div>""", unsafe_allow_html=True)
+                                    if len(buf) > int(target_words_num * 1.5): st.session_state.generation_running = False; st.toast("⚠️ 字数超限停止", icon="🛑"); break
+                                     
                             full_new = full_existing + buf
                             db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (full_new, current_chapter['id']))
                             force_update_book_time(db_mgr, current_book['id'])
                             st.session_state[content_key] = full_new 
                             record_token_usage(provider="AI", model=m_name, tokens=len(buf), action_name="沉浸写作", book_title=current_book['title'])
-                            log_operation("AI生成", f"生成完成: {current_chapter['title']}")
-                            st.session_state.generation_running = False
                             
-                            ai_status_box.empty()
-                            st.rerun() 
+                            # 🔥 审计：AI生成完成
+                            log_audit_event("AI创作", "单章生成完成", {"章节": current_chapter['title'], "生成字数": len(buf)})
+                            
+                            st.session_state.generation_running = False
+                            ai_status_box.empty(); st.rerun() 
                         else:
-                            ai_status_box.error("生成失败") 
-                            st.error(f"生成失败: {stream}"); st.session_state.generation_running = False
+                            ai_status_box.error("生成失败"); st.error(f"生成失败: {stream}"); st.session_state.generation_running = False
                 
                 if btn_stop:
-                    ai_status_box.empty()
-                    st.session_state.generation_running = False; log_operation("AI生成", "用户停止"); st.rerun()
+                    ai_status_box.empty(); st.session_state.generation_running = False; st.rerun()
 
                 if should_render_editor:
                     with editor_placeholder:
                         st.text_area(label="hidden_content", value=current_text, height=600, label_visibility="collapsed", key=content_key)
 
-        # ======================================================================
         # TAB 2: 批量生成
-        # ======================================================================
         with tab_outline:
              if not current_book: st.warning("请选择书籍")
              elif not parts: st.warning("无结构")
@@ -921,10 +923,8 @@ def render_writer(engine, current_book, current_chapter):
                     else:
                         c_names = [c['title'] for c in bg_chaps]
                         c1, c2 = st.columns(2)
-                        s_start = c1.selectbox("起始章", c_names, 0, key="bg_s")
-                        s_idx = c_names.index(s_start)
-                        s_end = c2.selectbox("结束章", c_names[s_idx:], len(c_names[s_idx:])-1, key="bg_e")
-                        e_idx = c_names.index(s_end)
+                        s_start = c1.selectbox("起始章", c_names, 0, key="bg_s"); s_idx = c_names.index(s_start)
+                        s_end = c2.selectbox("结束章", c_names[s_idx:], len(c_names[s_idx:])-1, key="bg_e"); e_idx = c_names.index(s_end)
                         target_chaps = bg_chaps[s_idx:e_idx+1]
                         st.info(f"选中: {len(target_chaps)} 章")
                         gen_prompt = st.text_area("通用大纲/指令", height=100, placeholder="例如：主角在这一段剧情中...")
@@ -933,62 +933,68 @@ def render_writer(engine, current_book, current_chapter):
                         with cm1:
                             def_b = get_safe_model_default("write_batch_gen", "GPT_4o")
                             assigned_b = st.session_state.model_assignments.get("write_batch_gen", def_b)
-                            model_display_name_b = MODEL_MAPPING.get(assigned_b, {}).get('name', assigned_b)
+                            model_display_name_b = ""
+                            if "CUSTOM" in assigned_b:
+                                c_data_b = get_custom_model_data(assigned_b)
+                                model_display_name_b = f"🟢 {c_data_b.get('api_model', 'Unknown')}" if c_data_b else f"🟢 {assigned_b}"
+                            elif assigned_b in MODEL_MAPPING:
+                                model_display_name_b = MODEL_MAPPING[assigned_b].get('name', assigned_b)
+                            else:
+                                model_display_name_b = assigned_b
+
                             st.markdown(f"**模型**"); st.caption(f"🚀 {model_display_name_b}")
-                            pk_b = assigned_b if assigned_b in MODEL_MAPPING else None
+                            pk_b = assigned_b if (assigned_b in MODEL_MAPPING or "CUSTOM" in assigned_b) else None
+
                         with cm2: len_b = st.slider("单章字数(k)", 1, 10, 3, key="bg_l")
                         with cm3:
                             st.markdown('<div style="padding-top: 29px;"></div>', unsafe_allow_html=True)
-                            # 🔥 修改: use_container_width -> width="stretch"
-                            btn_bg = st.button("🚀 开始批量", type="primary", width="stretch", disabled=st.session_state.generation_running)
-                        
+                            c_bg_start, c_bg_stop = st.columns(2)
+                            with c_bg_start:
+                                btn_bg = st.button("🚀 开始", type="primary", width="stretch", disabled=st.session_state.generation_running)
+                            with c_bg_stop:
+                                if st.button("⏹️ 停止", type="secondary", width="stretch", disabled=not st.session_state.generation_running, key="btn_stop_batch"):
+                                    st.session_state.generation_running = False; st.rerun()
+                                    
                         if btn_bg and pk_b:
                             if not gen_prompt.strip(): st.error("请输入大纲")
                             else:
-                                client, m_name, m_key = engine.get_client(pk_b)
+                                client = None; m_name = ""; m_key = ""
+                                if "CUSTOM" in pk_b:
+                                    c_data = get_custom_model_data(pk_b)
+                                    if c_data:
+                                        try:
+                                            client = OpenAI(api_key=c_data.get('key'), base_url=c_data.get('base'))
+                                            m_name = c_data.get('api_model', 'custom'); m_key = c_data.get('key')
+                                        except Exception as e: st.error(f"❌ 客户端创建失败: {e}")
+                                    else: st.error("❌ 自定义模型配置未找到")
+                                else:
+                                    client, m_name, m_key = engine.get_client(pk_b)
+
                                 if not client: st.error("API Key 未配置")
                                 else:
                                     st.session_state.generation_running = True
                                     ph = st.empty(); cnt = 0
-                                    ensure_log_file(); log_operation("AI批量", f"开始批量 {len(target_chaps)} 章")
+                                    ensure_log_file()
+                                    log_audit_event("AI创作", "批量生成启动", {"章节数": len(target_chaps), "模型": m_name})
                                     batch_hard_limit = len_b * 1000 * 1.5
-                                    
-                                    # 🔥 [修复核心]：安全 Token 限制
-                                    request_words_b = len_b * 1000
-                                    if request_words_b > MAX_SAFE_WORD_COUNT:
-                                        request_words_b = MAX_SAFE_WORD_COUNT
-                                        st.toast(f"⚠️ 批量生成字数已自动限制为 {MAX_SAFE_WORD_COUNT}", icon="🛡️")
+                                    request_words_b = min(len_b * 1000, MAX_SAFE_WORD_COUNT)
+                                    if request_words_b != len_b*1000: st.toast(f"⚠️ 自动限制为 {MAX_SAFE_WORD_COUNT}", icon="🛡️")
 
                                     try:
-                                        prev_chap_title = "前一章" # 初始占位
-
+                                        prev_chap_title = "前一章" 
                                         for idx, ch in enumerate(target_chaps):
                                             if not st.session_state.generation_running: ph.warning("已停止"); break
                                             ph.info(f"⏳ ({idx+1}/{len(target_chaps)}) 生成：{ch['title']}...")
-                                            
-                                            # 🔥 批量生成也获取增强版上下文
-                                            batch_context = get_full_context(db_mgr, current_book['id'], ch['id'])
-                                            # 修复：Row object has no get
-                                            ch_summary = ch['summary'] if ch['summary'] else ""
-                                            combined_outline = f"{gen_prompt}\n{ch_summary}"
-                                            
-                                            # 🔥 [修改核心]：强化批量的连续性与人物限制
-                                            final_batch_prompt = (
-                                                f"{batch_context}\n\n"
-                                                f"【批量生成 - 章节连续性要求】\n"
-                                                f"**这是第 {idx+1} 章，前一章是《{prev_chap_title}》**\n"
-                                                f"**强制要求**:\n"
-                                                f"1. 必须从上一章结尾的剧情点直接开始，不能跳过任何重要情节\n"
-                                                f"2. 如果上一章以对话结束，本章必须继续该对话或展示对话结果\n"
-                                                f"3. 人物位置、状态必须与上一章结尾一致\n"
-                                                f"4. 时间必须连续，不能有无故的时间跳跃\n"
-                                                f"5. **禁止重新介绍已在前面章节登场过的人物**\n"
-                                                f"【本章大纲与指令】\n{combined_outline}"
+                                            combined_outline = f"{gen_prompt}\n{ch['summary'] or ''}"
+                                            batch_context = get_full_context(
+                                                db_mgr, 
+                                                current_book['id'], 
+                                                ch['id'],
+                                                current_outline=combined_outline
                                             )
-                                            
+                                            final_batch_prompt = f"{batch_context}\n\n【批量生成连续性要求】\n**前一章是《{prev_chap_title}》**，请紧接其后。\n【本章大纲】\n{combined_outline}"
                                             db_mgr.execute("UPDATE chapters SET summary=? WHERE id=?", (combined_outline, ch['id']))
                                             full_c = ""
-                                            # 使用安全的 request_words_b
                                             ok, stream = engine.generate_content_from_outline_ai_stream(ch['id'], final_batch_prompt, current_book, request_words_b, client, m_name, m_key)
                                             if ok:
                                                 for chunk in stream:
@@ -998,19 +1004,18 @@ def render_writer(engine, current_book, current_chapter):
                                                         if len(full_c) > batch_hard_limit: break 
                                                 db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (full_c, ch['id']))
                                                 record_token_usage(provider="AI", model=m_name, tokens=len(full_c), action_name="批量生成", book_title=current_book['title'])
-                                                cnt += 1
-                                                prev_chap_title = ch['title'] # 更新前一章标题供下一次循环使用
+                                                cnt += 1; prev_chap_title = ch['title']
                                             else: st.error(f"失败: {ch['title']}")
-                                        
                                         force_update_book_time(db_mgr, current_book['id'])
                                         ph.success(f"🎉 完成！共 {cnt} 章")
                                     except Exception as e: ph.error(f"错误: {e}")
                                     finally: st.session_state.generation_running = False; time.sleep(2); st.rerun()
 
-        # ======================================================================
         # TAB 3: 写作辅助
-        # ======================================================================
         with tab_assist:
+            # 🔥 强制直连刷新，获取最新配置
+            current_assignments = get_config_direct_from_db("model_assignments", {})
+            
             all_chaps_in_book = db_mgr.query("SELECT c.id, c.title, c.content, c.summary FROM chapters c JOIN volumes v ON c.volume_id = v.id JOIN parts p ON v.part_id = p.id WHERE p.book_id = ? ORDER BY p.sort_order, v.sort_order, c.sort_order", (current_book['id'],))
             
             if not all_chaps_in_book: st.info("请先创建章节。")
@@ -1023,24 +1028,42 @@ def render_writer(engine, current_book, current_chapter):
                 target_chap_id = chap_options[target_chap_title]
                 target_chap_data = next((c for c in all_chaps_in_book if c['id'] == target_chap_id), None)
                 target_content = target_chap_data['content'] if target_chap_data else ""
+                target_summary = target_chap_data['summary'] if target_chap_data else ""
                 
+                # 🔥 使用强制刷新的 assignments
                 def_cf = get_safe_model_default("write_logic_assist", "GPT_4o_Mini")
-                def_rw = get_safe_model_default("write_rewrite", "DSK_V3")
-                as_cf = st.session_state.model_assignments.get("write_logic_assist", def_cf)
-                as_rw = st.session_state.model_assignments.get("write_rewrite", def_rw)
                 
-                # --- 1. 矛盾/设定检测 ---
+                # 键名修正：write_re_write
+                def_rw = get_safe_model_default("write_re_write", "DSK_V3") 
+                as_cf = current_assignments.get("write_logic_assist", def_cf)
+                as_rw = current_assignments.get("write_re_write", def_rw) 
+                
+                display_name_cf = as_cf
+                if "CUSTOM" in as_cf:
+                    c_data_cf = get_custom_model_data(as_cf)
+                    if c_data_cf: display_name_cf = f"🟢 {c_data_cf.get('api_model', 'Unknown')}"
+                    else: display_name_cf = f"🔴 配置失效 ({as_cf})"
+                elif as_cf in MODEL_MAPPING:
+                    display_name_cf = MODEL_MAPPING[as_cf].get('name', as_cf)
+
                 st.subheader("🔎 矛盾检测")
-                m_info = MODEL_MAPPING.get(as_cf, {'name': '未配置或无效'})
-                st.caption(f"模型: **{m_info['name']}**")
-                # 🔥 修改: use_container_width -> width="stretch"
+                st.caption(f"模型: **{display_name_cf}**")
+                
                 if st.button("🚨 检测设定冲突", width="stretch"):
-                    client, m_name, m_key = engine.get_client(as_cf)
+                    client = None; m_name = ""; m_key = ""
+                    if "CUSTOM" in as_cf:
+                        c_data = get_custom_model_data(as_cf)
+                        if c_data:
+                            client = OpenAI(api_key=c_data.get('key'), base_url=c_data.get('base'))
+                            m_name = c_data.get('api_model'); m_key = c_data.get('key')
+                    else: client, m_name, m_key = engine.get_client(as_cf)
+
                     if not client: st.error("API Key 未配置")
                     else:
                         with st.spinner("正在对比设定集与前文..."):
-                            ensure_log_file(); log_operation("AI辅助", f"矛盾检测: {target_chap_title}")
-                            assist_context = get_full_context(db_mgr, current_book['id'], target_chap_id)
+                            ensure_log_file()
+                            log_audit_event("AI辅助", "矛盾检测", {"章节": target_chap_title, "模型": m_name})
+                            assist_context = get_full_context(db_mgr, current_book['id'], target_chap_id, current_outline=target_summary)
                             final_input = f"{assist_context}\n\n【待检测正文】\n{target_content}"
                             rep = engine.analyze_chapter_conflict(final_input, current_book, client, m_name, m_key)
                             if isinstance(rep, tuple): rep = rep[1]
@@ -1049,120 +1072,114 @@ def render_writer(engine, current_book, current_chapter):
                 rep_val = st.session_state.get(f"conflict_report_{target_chap_id}", "")
                 if rep_val: st.info("检测报告："); st.text_area("report", rep_val, height=150, disabled=True, label_visibility="collapsed")
                 
-                # --- 2. 剧情节点分析 (🔥 新增) ---
                 st.subheader("📊 剧情节点与连贯性")
-                col_plot1, col_plot2 = st.columns(2)
-                
-                with col_plot1:
-                    # 🔥 修改: use_container_width -> width="stretch"
+                c_pl1, c_pl2 = st.columns(2)
+                with c_pl1:
                     if st.button("🔍 深度分析剧情连贯性", width="stretch"):
-                         # 查找前一章
-                        chap_idx = -1
-                        for i, c in enumerate(all_chaps_in_book):
-                            if c['id'] == target_chap_id: chap_idx = i; break
-                        
+                        chap_idx = next((i for i, c in enumerate(all_chaps_in_book) if c['id'] == target_chap_id), -1)
                         if chap_idx > 0:
-                            prev_chap = all_chaps_in_book[chap_idx - 1]
                             tracker = PlotContinuityTracker(db_mgr, current_book['id'])
-                            report = tracker.get_chapter_continuity_report(prev_chap['id'], target_chap_id)
-                            st.session_state[f"plot_continuity_report_{target_chap_id}"] = report
-                        else:
-                            st.session_state[f"plot_continuity_report_{target_chap_id}"] = "这是第一章，无法进行章节间分析"
-                            
-                with col_plot2:
-                    # 🔥 修改: use_container_width -> width="stretch"
+                            st.session_state[f"plot_continuity_report_{target_chap_id}"] = tracker.get_chapter_continuity_report(all_chaps_in_book[chap_idx-1]['id'], target_chap_id)
+                        else: st.session_state[f"plot_continuity_report_{target_chap_id}"] = "这是第一章"
+                with c_pl2:
                     if st.button("👥 检测人物重复登场", width="stretch"):
-                         # 分析当前章节和前章的人物出现情况
-                        chap_idx = -1
-                        for i, c in enumerate(all_chaps_in_book):
-                            if c['id'] == target_chap_id: chap_idx = i; break
-                        
+                        chap_idx = next((i for i, c in enumerate(all_chaps_in_book) if c['id'] == target_chap_id), -1)
                         if chap_idx > 0:
-                            prev_chap = all_chaps_in_book[chap_idx - 1]
-                            # 修复：Row object has no get
-                            prev_content = prev_chap['content'] or ""
-                            prev_chars = get_current_chapter_characters(prev_content)
+                            prev_chars = get_current_chapter_characters(all_chaps_in_book[chap_idx-1]['content'] or "")
                             curr_chars = get_current_chapter_characters(target_content)
-                            repeated_chars = prev_chars.intersection(curr_chars)
-                            
-                            if repeated_chars:
-                                analysis = f"**检测到可能重复登场的人物**:\n"
-                                for char in repeated_chars:
-                                    analysis += f"- {char}: 在前一章《{prev_chap['title']}》已登场，本章可能重复介绍\n"
-                                analysis += f"\n**建议**: 检查本章对这些角色的描述是否冗余，应直接延续其行动而非重新介绍。"
-                            else:
-                                analysis = "✅ 未检测到明显的人物重复登场问题。"
-                            st.session_state[f"character_repeat_report_{target_chap_id}"] = analysis
-                        else:
-                            st.session_state[f"character_repeat_report_{target_chap_id}"] = "这是第一章，无需检测人物重复登场。"
+                            rep_chars = prev_chars.intersection(curr_chars)
+                            st.session_state[f"character_repeat_report_{target_chap_id}"] = f"**重复登场**: {', '.join(rep_chars)}" if rep_chars else "✅ 无重复"
+                        else: st.session_state[f"character_repeat_report_{target_chap_id}"] = "无需检测"
 
-                # 显示分析报告
-                continuity_report = st.session_state.get(f"plot_continuity_report_{target_chap_id}", "")
-                if continuity_report:
-                    st.markdown("##### 📈 剧情连贯性深度报告")
-                    st.markdown(continuity_report)
-                    if "警告" in continuity_report: st.error("⚠️ 检测到连贯性问题，请检查报告！")
-                
-                char_rep_report = st.session_state.get(f"character_repeat_report_{target_chap_id}", "")
-                if char_rep_report:
-                    st.info(char_rep_report)
+                if st.session_state.get(f"plot_continuity_report_{target_chap_id}"): st.markdown(st.session_state[f"plot_continuity_report_{target_chap_id}"])
+                if st.session_state.get(f"character_repeat_report_{target_chap_id}"): st.info(st.session_state[f"character_repeat_report_{target_chap_id}"])
 
-                # --- 3. 一键重写 ---
                 st.subheader("🔄 一键重写")
-                
                 c_style_1, c_style_2 = st.columns([2, 1])
                 with c_style_1:
                     style_rows = db_mgr.query("SELECT content FROM plots WHERE status='StyleDNA' AND book_id=?", (current_book['id'],))
-                    styles = [f"🎨 风格: {s['content']}" for s in style_rows]
-                    setting_rows = db_mgr.query("SELECT content FROM plots WHERE status LIKE 'Setting_%' AND book_id=?", (current_book['id'],))
-                    settings = []
-                    setting_content_map = {}
-                    for s in setting_rows:
-                        title = s['content'].split('\n')[0].strip()[:20]
-                        label = f"🌍 设定: {title}"
-                        settings.append(label)
-                        setting_content_map[label] = s['content']
-                    
-                    all_opts = ["(不使用额外参考)"] + styles + settings
-                    st.markdown('<label class="custom-select-label">🎨 参考风格/设定 (知识库)</label>', unsafe_allow_html=True)
+                    settings = db_mgr.query("SELECT content FROM plots WHERE status LIKE 'Setting_%' AND book_id=?", (current_book['id'],))
+                    all_opts = ["(不使用额外参考)"] + [f"🎨 风格: {s['content']}" for s in style_rows] + [f"🌍 设定: {s['content'][:20]}" for s in settings]
                     sel_opt = st.selectbox("参考风格/设定", all_opts, label_visibility="collapsed")
-                    
-                    target_style_content = ""
-                    if sel_opt != "(不使用额外参考)":
-                        if sel_opt.startswith("🎨"): target_style_content = sel_opt.replace("🎨 风格: ", "")
-                        elif sel_opt.startswith("🌍"): target_style_content = setting_content_map.get(sel_opt, "")
+                    target_style_content = sel_opt if sel_opt != "(不使用额外参考)" else ""
 
-                m_info_rw = MODEL_MAPPING.get(as_rw, {'name': '未配置或无效'})
                 with c_style_2:
-                    st.caption(f"模型: **{m_info_rw['name']}**")
-                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True) 
+                    display_name_rw = as_rw
+                    if "CUSTOM" in as_rw:
+                         c_data_rw = get_custom_model_data(as_rw)
+                         if c_data_rw: display_name_rw = f"🟢 {c_data_rw.get('api_model', 'Unknown')}"
+                         else: display_name_rw = f"🔴 配置失效 ({as_rw})"
+                    elif as_rw in MODEL_MAPPING:
+                        display_name_rw = MODEL_MAPPING[as_rw].get('name', as_rw)
+                    
+                    st.markdown(f"**模型**: {display_name_rw}")
+                    st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True) 
                 
-                # 🔥 修改: use_container_width -> width="stretch"
+                # 🔥 流式重写实现区
                 if st.button("🚀 根据建议/设定重写本章", type="primary", width="stretch"):
                     if not target_content: st.error("章节内容为空")
                     else:
-                        client, m_name, m_key = engine.get_client(as_rw)
+                        client = None; m_name = ""; m_key = ""
+                        if "CUSTOM" in as_rw:
+                            c_data = get_custom_model_data(as_rw)
+                            if c_data:
+                                client = OpenAI(api_key=c_data.get('key'), base_url=c_data.get('base'))
+                                m_name = c_data.get('api_model'); m_key = c_data.get('key')
+                        else: client, m_name, m_key = engine.get_client(as_rw)
+
                         if not client: st.error("API Key 未配置")
                         else:
-                            with st.spinner("AI 正在重塑章节..."):
-                                ensure_log_file(); log_operation("AI辅助", f"一键重写: {target_chap_title}")
-                                report_context = st.session_state.get(f"conflict_report_{target_chap_id}", "无特殊报告")
+                            st.session_state.generation_running = True
+                            
+                            # 构建 Prompt
+                            report_context = st.session_state.get(f"conflict_report_{target_chap_id}", "无特殊报告")
+                            prompt = "你是一个专业的网文写作助手。请根据以下要求重写提供的章节内容。\n\n"
+                            if target_style_content:
+                                prompt += f"【参考风格/设定】：\n{target_style_content}\n\n"
+                            if report_context and report_context != "无特殊报告":
+                                prompt += f"【需修正的逻辑/矛盾问题】：\n{report_context}\n\n"
+                            prompt += f"【原文内容】：\n{target_content[:MAX_SAFE_WORD_COUNT]}\n\n"
+                            prompt += "【重写要求】：\n1. 保持剧情核心不变，优化文笔。\n2. 解决上述提到的逻辑问题（如有）。\n3. 贴合参考风格（如有）。\n4. 直接输出重写后的正文，不要包含任何解释性语言。"
+
+                            ensure_log_file()
+                            log_audit_event("AI辅助", "章节重写", {"章节": target_chap_title, "模型": m_name})
+                            
+                            rewrite_placeholder = st.empty()
+                            full_response = ""
+                            
+                            try:
+                                stream = client.chat.completions.create(
+                                    model=m_name,
+                                    messages=[{"role": "user", "content": prompt}],
+                                    stream=True,
+                                    max_tokens=4096,
+                                    temperature=0.7
+                                )
                                 
-                                res = engine.rewrite_chapter_ai(target_content, report_context, target_style_content, client, m_name, m_key)
+                                for chunk in stream:
+                                    content = safe_get_content(chunk)
+                                    if content:
+                                        full_response += content
+                                        rewrite_placeholder.markdown(f"##### ⏳ 正在重写...\n\n{full_response}")
                                 
-                                if isinstance(res, tuple): res = res[1]
-                                st.session_state[f"rewritten_content_{target_chap_id}"] = res
-                                record_token_usage(provider="AI", model=m_name, tokens=len(res) if res else 0, action_name="章节重写", book_title=current_book['title'])
-                            st.success("完成")
+                                st.session_state[f"rewritten_content_{target_chap_id}"] = full_response
+                                record_token_usage(provider="AI", model=m_name, tokens=len(full_response), action_name="章节重写", book_title=current_book['title'])
+                                st.success("完成")
+                                st.session_state.generation_running = False
+                                time.sleep(0.5)
+                                st.rerun()
+                                
+                            except Exception as e:
+                                st.error(f"重写失败: {e}")
+                                st.session_state.generation_running = False
+                
                 rw_val = st.session_state.get(f"rewritten_content_{target_chap_id}", "")
                 if rw_val:
                     st.markdown("##### 预览重写结果")
                     st.text_area("preview", rw_val, height=300, label_visibility="collapsed")
-                    # 🔥 修改: use_container_width -> width="stretch"
                     if st.button(f"✅ 覆盖【{target_chap_title}】原内容", width="stretch"):
                         db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (rw_val, target_chap_id))
                         force_update_book_time(db_mgr, current_book['id'])
-                        if current_chapter and target_chap_id == current_chapter['id']:
-                            st.session_state[f"chapter_content_{target_chap_id}"] = rw_val
-                        log_operation("更新章节", f"应用重写: {target_chap_title}")
+                        if current_chapter and target_chap_id == current_chapter['id']: st.session_state[f"chapter_content_{target_chap_id}"] = rw_val
+                        log_audit_event("内容编辑", "应用重写", {"章节": target_chap_title})
                         st.session_state.rerun_flag = True; st.rerun()

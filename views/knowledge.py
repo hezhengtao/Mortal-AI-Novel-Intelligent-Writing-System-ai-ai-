@@ -7,10 +7,65 @@ import time
 import base64
 import html
 import re
+import csv
+import uuid
+import threading
 from datetime import datetime
-from utils import render_header, ensure_log_file, log_operation
-from logic import FEATURE_MODELS, MODEL_MAPPING
+from utils import render_header, ensure_log_file # log_operation 已废弃
+
+# 🔥 导入 OpenAI 类，以便在自定义模型解析中实例化
+from logic import FEATURE_MODELS, MODEL_MAPPING, OpenAI
 from config import DATA_DIR 
+
+# ==============================================================================
+# 🛡️ 严格审计日志系统 (Knowledge 集成版)
+# ==============================================================================
+
+SYSTEM_LOG_PATH = os.path.join(DATA_DIR, "logs", "system_audit.csv")
+_log_lock = threading.Lock()
+
+def get_session_id():
+    """获取或生成当前会话的唯一追踪ID"""
+    if "session_trace_id" not in st.session_state:
+        st.session_state.session_trace_id = str(uuid.uuid4())[:8]
+    return st.session_state.session_trace_id
+
+def log_audit_event(category, action, details, status="SUCCESS", module="KNOWLEDGE"):
+    """
+    执行严格的审计日志写入
+    """
+    try:
+        os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        session_id = get_session_id()
+        
+        status_map = {"SUCCESS": "成功", "WARNING": "警告", "ERROR": "错误"}
+        status_cn = status_map.get(status, status)
+        
+        module_map = {
+            "KNOWLEDGE": "知识库", 
+            "CHARACTERS": "角色管理", 
+            "BOOKS": "书籍管理", 
+            "WRITER": "写作终端", 
+            "SETTINGS": "系统设置"
+        }
+        module_cn = module_map.get(module, module)
+
+        if isinstance(details, (dict, list)):
+            try: details = json.dumps(details, ensure_ascii=False)
+            except: details = str(details)
+            
+        row = [timestamp, session_id, module_cn, category, action, status_cn, details]
+        
+        with _log_lock:
+            file_exists = os.path.exists(SYSTEM_LOG_PATH)
+            with open(SYSTEM_LOG_PATH, mode='a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                if not file_exists or os.path.getsize(SYSTEM_LOG_PATH) == 0:
+                    writer.writerow(['时间', '会话ID', '模块', '类别', '操作', '状态', '详情']) 
+                writer.writerow(row)
+    except Exception as e:
+        print(f"❌ 审计日志写入失败: {e}")
 
 # ==============================================================================
 #  基础配置 & CSS 样式注入
@@ -145,6 +200,46 @@ def find_mentions_in_book(db_mgr, book_id, keyword):
     return results
 
 # ==============================================================================
+# 🔥 新增：自定义模型解析器 (与 Books/Characters 模块保持一致)
+# ==============================================================================
+def _resolve_ai_client(engine, assigned_key):
+    """
+    智能解析客户端：支持原生模型 + 自定义模型(CUSTOM::)
+    """
+    # 1. 拦截自定义模型
+    if assigned_key and str(assigned_key).startswith("CUSTOM::"):
+        try:
+            # 提取真实名称
+            target_name = assigned_key.split("::", 1)[1]
+            
+            # 从数据库读取配置
+            settings = engine.get_config_db("ai_settings", {})
+            custom_list = settings.get("custom_model_list", [])
+            
+            # 查找匹配项
+            for m in custom_list:
+                if m.get("name") == target_name:
+                    api_key = m.get("key")
+                    base_url = m.get("base")
+                    model_id = m.get("api_model")
+                    
+                    if not api_key or not base_url:
+                        return None, None, None
+                        
+                    # 实例化 OpenAI (使用 logic 中导入的类)
+                    client = OpenAI(api_key=api_key, base_url=base_url)
+                    return client, model_id, "custom"
+            
+            print(f"❌ 未找到自定义模型配置: {target_name}")
+            return None, None, None
+        except Exception as e:
+            print(f"❌ 自定义模型解析失败: {e}")
+            return None, None, None
+
+    # 2. 原生模型走默认逻辑
+    return engine.get_client(assigned_key)
+
+# ==============================================================================
 # 核心渲染逻辑
 # ==============================================================================
 
@@ -252,6 +347,10 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                                 db_mgr.execute("INSERT INTO plots (book_id, content, status, importance) VALUES (?,?,?,?)", 
                                                (current_book_id, row['content'], row['status'], row['importance']))
                                 count += 1
+                            
+                            # 🔥 审计：导入设定
+                            log_audit_event("设定管理", "导入设定", {"来源书籍": imp_book_title, "条目数": count})
+                            
                             st.toast(f"✅ 成功导入 {count} 条设定")
                             time.sleep(1); st.rerun()
                     else: st.caption("无其他书籍")
@@ -327,6 +426,10 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                             db_mgr.execute("INSERT INTO plots (book_id, content, status, importance) VALUES (?, ?, ?, 0)", 
                                            (current_book_id, f"{n_title}\n{n_content}", f"Setting_{sel_type}"))
                             update_book_timestamp_by_book_id(current_book_id)
+                            
+                            # 🔥 审计：新建设定
+                            log_audit_event("设定管理", "新建设定", {"分类": sel_type, "标题": n_title})
+                            
                             st.toast("✅ 保存成功"); time.sleep(0.5); st.rerun()
                         else: st.error("请填写完整")
 
@@ -406,6 +509,10 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                                         target_char['id']
                                     ))
                                     update_book_timestamp_by_book_id(current_book_id)
+                                    
+                                    # 🔥 审计：更新角色
+                                    log_audit_event("角色档案", "更新角色详情", {"ID": target_char['id'], "姓名": e_name})
+                                    
                                     st.toast(f"✅ 角色 {e_name} 更新成功！")
                                     time.sleep(0.5)
                                     st.rerun()
@@ -440,12 +547,20 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                         c_del, c_upd = st.columns([1, 1])
                         if c_del.form_submit_button("🗑️ 删除", type="secondary"):
                             db_mgr.execute("DELETE FROM plots WHERE id=?", (item['id'],))
+                            
+                            # 🔥 审计：删除设定
+                            log_audit_event("设定管理", "删除设定", {"ID": item['id'], "标题": curr_title}, status="WARNING")
+                            
                             st.session_state['know_sel_key'] = "新建条目"; st.rerun()
                         if c_upd.form_submit_button("💾 保存", type="primary"):
                             # 🔥 保存时也不带英文标签，保持数据纯净
                             db_mgr.execute("UPDATE plots SET content=?, status=? WHERE id=?", 
                                            (f"{n_title_val}\n{n_body_val}", f"Setting_{n_type}", item['id']))
                             update_book_timestamp_by_book_id(current_book_id)
+                            
+                            # 🔥 审计：更新设定
+                            log_audit_event("设定管理", "更新设定", {"ID": item['id'], "标题": n_title_val, "分类": n_type})
+                            
                             st.toast("✅ 更新成功"); time.sleep(0.5); st.rerun()
 
     # --------------------------------------------------------------------------
@@ -478,10 +593,16 @@ def render_knowledge(engine, current_book_arg, current_chapter):
         
         if st.button("🚀 开始提炼风格 DNA", type="primary", use_container_width=True):
             if source_text:
-                client, model, _ = engine.get_client("knowledge_analyze")
+                # 🔥 修复：使用支持自定义模型的解析器
+                # 原代码: client, model, _ = engine.get_client("knowledge_analyze")
+                assigned_key = engine.get_config_db("model_assignments", {}).get("knowledge_analyze", FEATURE_MODELS["knowledge_analyze"]['default'])
+                client, model, _ = _resolve_ai_client(engine, assigned_key)
+                
                 if client:
                     ensure_log_file()
-                    log_operation("AI生成", f"开始分析风格: {source_name}")
+                    
+                    # 🔥 审计：启动风格提炼
+                    log_audit_event("AI辅助", "启动风格提炼", {"源文本名": source_name, "文本长度": len(source_text)})
                     
                     # 🔥 进度条逻辑
                     progress_bar = st.progress(0, text="🚀 正在启动 AI 引擎...")
@@ -503,10 +624,18 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                         update_book_timestamp_by_book_id(current_book_id)
                         
                         progress_bar.progress(100, text="✅ 提炼完成！")
+                        
+                        # 🔥 审计：风格提炼成功
+                        log_audit_event("AI辅助", "风格提炼完成", {"风格名称": sn})
+                        
                         st.success(f"风格档案已保存：{sn}")
                         time.sleep(1); st.rerun()
                     except Exception as e: 
                         progress_bar.empty()
+                        
+                        # 🔥 审计：风格提炼失败
+                        log_audit_event("AI辅助", "风格提炼失败", {"错误": str(e)}, status="ERROR")
+                        
                         st.error(f"分析失败: {e}")
                 else: st.error("未配置 AI 模型")
             else: st.error("请提供有效文本")
@@ -519,7 +648,12 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                 c1, c2 = st.columns([4, 1])
                 c1.markdown(f"**🎨 {s['content']}**")
                 if c2.button("🗑️", key=f"ds_{s['id']}"):
-                    db_mgr.execute("DELETE FROM plots WHERE id=?", (s['id'],)); st.rerun()
+                    db_mgr.execute("DELETE FROM plots WHERE id=?", (s['id'],))
+                    
+                    # 🔥 审计：删除风格
+                    log_audit_event("AI辅助", "删除风格", {"ID": s['id'], "内容": s['content']}, status="WARNING")
+                    
+                    st.rerun()
         else: st.info("📭 暂无数据。请上传大神作品（如金庸小说片段）来提取风格。")
 
     # --------------------------------------------------------------------------
@@ -573,10 +707,16 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                 if not input_content.strip():
                     st.warning("⚠️ 请先输入内容")
                 else:
-                    client, model, _ = engine.get_client("knowledge_style_gen")
+                    # 🔥 修复：使用支持自定义模型的解析器
+                    # 原代码: client, model, _ = engine.get_client("knowledge_style_gen")
+                    assigned_key = engine.get_config_db("model_assignments", {}).get("knowledge_style_gen", FEATURE_MODELS["knowledge_style_gen"]['default'])
+                    client, model, _ = _resolve_ai_client(engine, assigned_key)
+                    
                     if client:
                         ensure_log_file()
-                        log_operation("AI辅助", f"风格重写: {sel_style}")
+                        
+                        # 🔥 审计：启动重写
+                        log_audit_event("AI辅助", "启动风格重写", {"目标风格": sel_style, "字数": len(input_content)})
                         
                         progress_text = "✨ AI 正在挥毫泼墨..."
                         my_bar = st.progress(0, text=progress_text)
@@ -602,10 +742,16 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                                     st.session_state['last_trans'] = full_res
                             
                             my_bar.progress(100, text="✅ 重写完成！")
+                            
+                            # 🔥 审计：重写完成
+                            log_audit_event("AI辅助", "风格重写完成", {"输出字数": len(full_res)})
+                            
                             time.sleep(0.5); my_bar.empty()
                             st.rerun() # 刷新以显示结果在下方文本框
                             
                         except Exception as e:
+                            # 🔥 审计：重写失败
+                            log_audit_event("AI辅助", "风格重写失败", {"错误": str(e)}, status="ERROR")
                             st.error(f"AI 调用错误: {e}")
                     else: st.error("未配置 AI 模型")
 
@@ -614,6 +760,10 @@ def render_knowledge(engine, current_book_arg, current_chapter):
                 st.markdown("<br>", unsafe_allow_html=True)
                 if st.button("💾 覆盖原章节", type="secondary", use_container_width=True, help="将右侧结果保存回当前章节"):
                     db_mgr.execute("UPDATE chapters SET content=? WHERE id=?", (st.session_state['last_trans'], t_id))
+                    
+                    # 🔥 审计：保存重写
+                    log_audit_event("内容编辑", "保存重写内容", {"章节ID": t_id, "长度": len(st.session_state['last_trans'])})
+                    
                     st.toast("✅ 已保存至章节！")
                     time.sleep(1)
 

@@ -1,3 +1,5 @@
+# mortal_write/views/books.py
+
 import streamlit as st
 import re
 import os
@@ -7,8 +9,6 @@ import urllib.parse
 import random
 import time
 import html
-import uuid
-import threading
 from datetime import datetime, timezone, timedelta
 
 # 引入格式处理库
@@ -29,6 +29,7 @@ except ImportError:
 # 从 utils 导入
 from utils import (
     render_header, 
+    log_operation, 
     generate_book_content, 
     ensure_log_file,
     save_file_locally,
@@ -41,47 +42,6 @@ try:
     from config import DATA_DIR
 except ImportError:
     DATA_DIR = "data"
-
-# ==============================================================================
-# 🛡️ 严格审计日志系统 (Books 集成版)
-# ==============================================================================
-
-SYSTEM_LOG_PATH = os.path.join(DATA_DIR, "logs", "system_audit.csv")
-_log_lock = threading.Lock()
-
-def get_session_id():
-    """获取或生成当前会话的唯一追踪ID"""
-    if "session_trace_id" not in st.session_state:
-        st.session_state.session_trace_id = str(uuid.uuid4())[:8]
-    return st.session_state.session_trace_id
-
-def log_audit_event(category, action, details, status="SUCCESS", module="BOOKS"):
-    try:
-        os.makedirs(os.path.dirname(SYSTEM_LOG_PATH), exist_ok=True)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        session_id = get_session_id()
-        
-        status_map = {"SUCCESS": "成功", "WARNING": "警告", "ERROR": "错误"}
-        status_cn = status_map.get(status, status)
-        
-        module_map = {"BOOKS": "书籍管理", "WRITER": "写作终端", "SETTINGS": "系统设置"}
-        module_cn = module_map.get(module, module)
-
-        if isinstance(details, (dict, list)):
-            try: details = json.dumps(details, ensure_ascii=False)
-            except: details = str(details)
-            
-        row = [timestamp, session_id, module_cn, category, action, status_cn, details]
-        
-        with _log_lock:
-            file_exists = os.path.exists(SYSTEM_LOG_PATH)
-            with open(SYSTEM_LOG_PATH, mode='a', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
-                if not file_exists or os.path.getsize(SYSTEM_LOG_PATH) == 0:
-                    writer.writerow(['时间', '会话ID', '模块', '类别', '操作', '状态', '详情']) 
-                writer.writerow(row)
-    except Exception as e:
-        print(f"❌ 审计日志写入失败: {e}")
 
 # ==============================================================================
 # 1. 基础配置
@@ -150,17 +110,6 @@ def save_relations_to_disk(book_id, relations_data):
     except Exception as e:
         print(f"Save Relation Error: {e}")
         return False
-
-def load_relations_from_disk(book_id):
-    file_path = os.path.join(get_relation_dir(), f"book_{book_id}.json")
-    if os.path.exists(file_path):
-        try:
-            with open(file_path, "r", encoding="utf-8") as f: 
-                return json.load(f)
-        except Exception as e:
-            print(f"Load Error: {e}")
-            return []
-    return []
 
 def record_token_usage(provider, model, tokens, action_name, book_title=None):
     try:
@@ -231,7 +180,7 @@ def generate_bing_search_image(keyword):
 def audit_download_callback(book_title, book_id):
     try:
         ensure_log_file()
-        log_audit_event("数据导出", "下载书籍TXT", {"书籍": book_title, "ID": book_id})
+        log_operation("数据导出", f"用户下载书籍TXT: 《{book_title}》 (ID:{book_id})")
     except Exception as e: print(f"Logging Error: {e}")
 
 def robust_decode(data_bytes):
@@ -273,279 +222,73 @@ def extract_text_from_file(uploaded_file):
 
 def extract_and_parse_json(content):
     """
-    🔥 超级增强版 JSON 解析器：自动修复截断、补全括号
+    解析 JSON 内容，支持对象和数组格式，增强对截断 JSON 的修复能力
     """
     try:
+        # 清理代码块标记
         content = re.sub(r'```json\s*', '', content, flags=re.IGNORECASE)
         content = re.sub(r'```\s*', '', content)
-        content_clean = content.strip()
-
-        # 1. 尝试直接解析
-        try:
-            return json.loads(content_clean, strict=False)
-        except:
-            pass
-
-        # 2. 寻找边界
-        start_brace = content.find('{')
-        start_bracket = content.find('[')
         
-        start_idx = -1
-        if start_brace != -1 and start_bracket != -1:
-            start_idx = min(start_brace, start_bracket)
-        elif start_brace != -1:
-            start_idx = start_brace
-        elif start_bracket != -1:
-            start_idx = start_bracket
+        # 寻找 JSON 边界
+        start = content.find('{')
+        end = content.rfind('}')
+        
+        if start == -1:
+            start = content.find('[')
+            end = content.rfind(']')
+        
+        if start != -1:
+            # 如果没找到结束符，说明被截断了
+            if end == -1 or end < start:
+                 json_str = content[start:].strip()
+            else:
+                 json_str = content[start:end+1].strip()
             
-        if start_idx == -1:
-            return None
-
-        json_candidate = content[start_idx:].strip()
-
-        # 3. 智能修复函数
-        def attempt_fix_and_load(raw_str):
             try:
-                return json.loads(raw_str, strict=False)
+                return json.loads(json_str, strict=False)
             except json.JSONDecodeError:
-                fixed = raw_str.rstrip()
-                if fixed.endswith(','): fixed = fixed[:-1]
-                if fixed.count('"') % 2 != 0: fixed += '"'
-                
-                open_braces = fixed.count('{') - fixed.count('}')
-                open_brackets = fixed.count('[') - fixed.count(']')
-                
-                patches = []
-                # 方案1：先补 } 再补 ]
-                patch_str_1 = ('}' * open_braces) + (']' * open_brackets) 
-                patches.append(patch_str_1)
-                # 方案2：先补 ] 再补 }
-                patch_str_2 = (']' * open_brackets) + ('}' * open_braces) 
-                patches.append(patch_str_2)
-                
-                for p in patches:
-                    try: return json.loads(fixed + p, strict=False)
-                    except: continue
-                return None
-
-        parsed = attempt_fix_and_load(json_candidate)
-        if parsed: return parsed
-        
-        # 4. 尝试截取到最后一个闭合符
-        end_brace = json_candidate.rfind('}')
-        end_bracket = json_candidate.rfind(']')
-        end_idx = max(end_brace, end_bracket)
-        
-        if end_idx != -1:
-            sub_candidate = json_candidate[:end_idx+1]
-            try: return json.loads(sub_candidate, strict=False)
-            except: pass
-
-        return None
-    except Exception:
+                # 🚑 【抢救模式】尝试修复截断的 JSON
+                try:
+                    # 1. 极其暴力的补全
+                    fixed_str = json_str.rstrip(',')
+                    if fixed_str.count('"') % 2 != 0: fixed_str += '"'
+                    if fixed_str.count('{') > fixed_str.count('}'): fixed_str += '}' * (fixed_str.count('{') - fixed_str.count('}'))
+                    if fixed_str.count('[') > fixed_str.count(']'): fixed_str += ']' * (fixed_str.count('[') - fixed_str.count(']'))
+                    return json.loads(fixed_str, strict=False)
+                except:
+                    # 2. 正则提取兜底 (针对列表结构)
+                    try:
+                        print("⚠️ JSON 严重损坏，尝试正则提取对象...")
+                        # 尝试匹配完整的对象 {...}
+                        matches = re.findall(r'\{[^{}]*\}', json_str)
+                        valid_objs = []
+                        for m in matches:
+                            try: valid_objs.append(json.loads(m))
+                            except: pass
+                        if valid_objs:
+                            # 猜测这可能是 characters 或 chapters
+                            if "name" in valid_objs[0]: return {"characters": valid_objs}
+                            if "title" in valid_objs[0]: return {"chapters": valid_objs}
+                            return valid_objs
+                    except:
+                        pass
+                        
+        print(f"JSON Parse Failed. Raw content start: {content[:100]}")
         return None
 
-def _resolve_ai_client(engine, assigned_key):
-    """
-    智能解析客户端：支持自定义模型(CUSTOM::) 和 原生模型
-    添加调试日志以排查AI调用问题
-    """
-    print(f"🔍 解析AI客户端，分配key: {assigned_key}")
-    
-    # 1. 拦截自定义模型
-    if assigned_key and str(assigned_key).startswith("CUSTOM::"):
-        try:
-            target_name = assigned_key.split("::", 1)[1]
-            print(f"🔍 检测到自定义模型: {target_name}")
-            settings = engine.get_config_db("ai_settings", {})
-            custom_list = settings.get("custom_model_list", [])
-            print(f"🔍 自定义模型列表: {len(custom_list)} 个")
-            
-            for m in custom_list:
-                if m.get("name") == target_name:
-                    api_key = m.get("key")
-                    base_url = m.get("base")
-                    model_id = m.get("api_model")
-                    print(f"🔍 找到匹配模型: {model_id}, base_url: {base_url}")
-                    
-                    if not api_key or not base_url: 
-                        print("❌ API Key 或 Base URL 缺失")
-                        return None, None, None
-                    
-                    client = OpenAI(api_key=api_key, base_url=base_url)
-                    return client, model_id, "custom"
-            
-            print(f"❌ 未找到自定义模型配置: {target_name}")
-            return None, None, None
-        except Exception as e:
-            print(f"❌ 自定义模型解析失败: {e}")
-            return None, None, None
-
-    # 2. 原生模型
-    print(f"🔍 使用原生模型: {assigned_key}")
-    return engine.get_client(assigned_key)
-
-# ==============================================================================
-# 关系处理函数（按照characters.py的方法改造）
-# ==============================================================================
-
-def extract_simple_relation(full_label):
-    """从完整关系描述中提取简单关系词"""
-    if not full_label:
-        return "相关"
-    
-    # 常见关系词映射
-    relation_map = {
-        "师徒": ["师徒", "师父", "徒弟", "传道", "授业"],
-        "伴侣": ["夫妻", "道侣", "情侣", "恋人", "伴侣", "配偶"],
-        "亲人": ["父子", "母女", "兄弟", "姐妹", "兄妹", "姐弟", "亲属", "亲戚"],
-        "朋友": ["好友", "朋友", "挚友", "死党", "兄弟", "姐妹"],
-        "敌对": ["仇敌", "敌人", "对手", "宿敌", "死对头"],
-        "师徒": ["师父", "徒弟", "师徒", "传人", "弟子"],
-        "上下级": ["主仆", "君臣", "上司", "下属", "领导"],
-        "恩人": ["救命恩人", "恩人", "有恩"],
-        "仇人": ["仇人", "血仇", "世仇", "死仇"]
-    }
-    
-    full_label_lower = full_label.lower()
-    
-    for simple_rel, keywords in relation_map.items():
-        for keyword in keywords:
-            if keyword in full_label_lower:
-                return simple_rel
-    
-    # 如果没匹配到，取前2-4个字符
-    if len(full_label) <= 4:
-        return full_label
-    else:
-        return full_label[:3] + ".."
-
-def _write_ai_relations(db_mgr, book_id, relations, char_map):
-    """按照characters.py格式保存关系数据"""
-    if not relations: return 0
-    n_rels = 0
-    clean_relations = []
-    
-    # 构建更鲁棒的映射表：{ "林溯": id, "lin su": id }
-    normalized_map = {}
-    for name, cid in char_map.items():
-        normalized_map[name.strip()] = cid
-        normalized_map[name.strip().lower()] = cid
-    
-    for rel in relations:
-        if not isinstance(rel, dict): continue
-        
-        # 🔥 核心修复：确保名字是干净的字符串
-        char1 = _safe_clean_text(rel.get('char1', '')).strip()
-        char2 = _safe_clean_text(rel.get('char2', '')).strip()
-        desc = _safe_clean_text(rel.get('desc', '关联'))
-        
-        # 🔥 获取详细描述字段
-        detail = _safe_clean_text(rel.get('detail', ''))
-        reason = _safe_clean_text(rel.get('reason', ''))
-        description = _safe_clean_text(rel.get('description', ''))
-        
-        # 🔥 构建详细描述：优先使用detail，其次是reason，最后是description
-        detailed_desc = ""
-        if detail:
-            detailed_desc = detail
-        elif reason:
-            detailed_desc = reason
-        elif description:
-            detailed_desc = description
-        else:
-            detailed_desc = desc  # 默认使用简短描述
-        
-        if not char1 or not char2: continue
-
-        c1_id = normalized_map.get(char1) or normalized_map.get(char1.lower())
-        c2_id = normalized_map.get(char2) or normalized_map.get(char2.lower())
-        
-        # 模糊匹配尝试
-        if not c1_id:
-            for k, v in normalized_map.items(): 
-                if char1 in k or k in char1: c1_id = v; break
-        if not c2_id:
-            for k, v in normalized_map.items():
-                if char2 in k or k in char2: c2_id = v; break
-
-        if c1_id and c2_id and c1_id != c2_id:
-            # 🔥 按照characters.py格式保存关系数据
-            clean_relations.append({
-                "source": c1_id, 
-                "target": c2_id, 
-                "label": desc,  # 完整关系描述
-                "description": detailed_desc,  # 详细描述
-                "weight": 3
-            })
-            n_rels += 1
-            
-    save_relations_to_disk(book_id, clean_relations)
-    return n_rels
+    except Exception as e:
+        print(f"General Parse Error: {e}")
+        return None
 
 # ==============================================================================
 # 3. 核心逻辑
 # ==============================================================================
 
-# 🔥 新增：强力清洗函数，专门处理 AI 返回的字典或脏数据
-def _safe_clean_text(val):
-    """
-    智能清洗数据：去除 JSON 格式，仅保留核心文本
-    解决 {"title": "..."} 这种乱码写入数据库的问题
-    """
-    if val is None: return ""
-    
-    # 如果已经是字典或列表，进行拆包
-    if isinstance(val, (dict, list)):
-        try:
-            # 如果是字典，优先提取 content/desc/description/value
-            if isinstance(val, dict):
-                # 尝试提取有意义的字段
-                candidates = [
-                    val.get('content'), 
-                    val.get('desc'), 
-                    val.get('description'), 
-                    val.get('value'),
-                    val.get('summary')
-                ]
-                # 过滤掉 None 和空字符串
-                valid = [str(c).strip() for c in candidates if c and str(c).strip()]
-                
-                if valid:
-                    # 如果有 content, 返回 content
-                    return valid[0]
-                
-                # 如果没有常用键，且有 title，返回 title: content 格式（如果有的话）
-                if 'title' in val:
-                    # 尝试找其他剩余的 value
-                    rest = [str(v) for k, v in val.items() if k != 'title' and v]
-                    if rest:
-                        return f"{val['title']}: {', '.join(rest)}"
-                    return str(val['title'])
-                    
-                # 实在不行，拼接所有 value
-                return " ".join([str(v) for v in val.values() if isinstance(v, (str, int, float))])
-            
-            # 如果是列表，递归清洗并拼接
-            if isinstance(val, list):
-                return ", ".join([_safe_clean_text(x) for x in val if x])
-                
-        except:
-            return str(val)
-            
-    # 如果是字符串，尝试去除首尾引号
-    s = str(val).strip()
-    if s.startswith('"') and s.endswith('"'): s = s[1:-1]
-    return s
-
 def _write_detailed_world_settings(db_mgr, book_id, settings_list):
+    """写入世界观，映射到 Status 字段"""
     if not settings_list: return 0
     saved_count = 0
     
-    # 兼容: 如果传入的是单个字典而不是列表（修复AI返回单对象问题）
-    if isinstance(settings_list, dict):
-        settings_list = [settings_list]
-
     type_map = {
         "PowerSystem": "PowerSystem", 
         "Geography": "Geography",     
@@ -561,27 +304,20 @@ def _write_detailed_world_settings(db_mgr, book_id, settings_list):
         for item in settings_list:
             if not isinstance(item, dict): continue
             
-            # 🔥 修复：使用清洗函数
-            title = _safe_clean_text(item.get("title", "未命名设定"))
-            
-            # 尝试获取内容
+            title = item.get("title", "未命名设定")
             content = item.get("content", "")
-            
-            # 如果没有content但有mechanism/description/desc，则拼凑
-            if not content:
-                parts = []
-                if "mechanism" in item: parts.append(f"【机制】{_safe_clean_text(item['mechanism'])}")
-                if "代价" in item: parts.append(f"【代价】{_safe_clean_text(item['代价'])}")
-                if "desc" in item: parts.append(_safe_clean_text(item['desc']))
-                if "description" in item: parts.append(_safe_clean_text(item['description']))
-                content = "\n".join(parts)
-            
-            full_content = f"{title}\n{_safe_clean_text(content)}"
-            
             category = item.get("category", "Other")
-            mapped_cat = type_map.get(category, 'Other')
-            db_status = f"Setting_{mapped_cat}"
             
+            if category in ["History", "Myth"]: category = "History"
+            if category in ["Rules", "Laws"]: category = "RuleSystem"
+            if category in ["Culture", "Customs"]: category = "Culture"
+            
+            mapped_cat = type_map.get(category, 'Other')
+            
+            # 🔥 修改处：去掉了 【{category}】 前缀，只保留标题和内容，解决显示英文标签问题
+            full_content = f"{title}\n{content}"
+            
+            db_status = f"Setting_{mapped_cat}"
             try:
                 db_mgr.execute(
                     "INSERT INTO plots (book_id, content, status, importance) VALUES (?, ?, ?, 10)",
@@ -593,41 +329,26 @@ def _write_detailed_world_settings(db_mgr, book_id, settings_list):
     return saved_count
 
 def analyze_book_metadata_deep_ai(engine, book_title, full_text):
-    # 🔥 修复核心：优先读取用户配置的 model_assignments，而不是写死 DSK_V3
-    assignments = engine.get_config_db("model_assignments", {})
-    assigned_key = assignments.get("import_char_analysis") 
-    
-    # 如果没配置，则回退到默认
-    if not assigned_key:
-        assigned_key = FEATURE_MODELS.get("import_char_analysis", {}).get('default', 'DSK_V3')
-    
-    client, model_name, _ = _resolve_ai_client(engine, assigned_key)
-    
-    if not client: 
-        print(f"❌ Client resolution failed for key: {assigned_key}")
-        return None, 0
+    assigned_key = FEATURE_MODELS.get("import_char_analysis", {}).get('default', 'DSK_V3')
+    client, model_name, _ = engine.get_client(assigned_key)
+    if not client: return None, 0
 
-    log_audit_event("书籍导入", "AI深度分析开始", {"书籍": book_title, "Model": assigned_key})
+    log_operation("AI分析", f"开始深度分析书籍: {book_title}")
     
-    sample = full_text[:25000]
+    sample = full_text[:25000] # 增加采样长度
     
     prompt = f"""
     你是一位资深网文主编。用户上传了小说《{book_title}》。
     
     请执行以下逻辑：
-    1. **知识检索**：如果你确信自己阅览过《{book_title}》（且作者匹配），请直接根据你的知识库生成该书的详细数据。
-    2. **文本分析**：如果你不认识这本书，必须基于我提供的【文本前2.5万字】进行分析。
+    1. **知识检索**：如果你非常确信自己阅览过《{book_title}》（且作者匹配），请直接根据你的知识库生成该书的详细数据。
+    2. **文本分析**：如果你不认识这本书，或者书名太通用，请必须基于我提供的【文本前2.5万字】进行分析。
     
     【任务目标】
-    请返回一个**纯 JSON 对象**。
-    ⚠️ **重要指令**：
-    1. **所有value值必须且只能使用简体中文**（avatar_kw除外）。
-    2. gender字段必须严格为 "男" 或 "女"。
-    3. JSON格式必须合法，不要包含 ```json 标记。
+    请返回一个**纯 JSON 对象**，不要包含任何 Markdown 标记，严格遵守以下结构：
     
-    严格遵守以下结构：
     {{
-        "synopsis": "剧情梗概(中文)",
+        "synopsis": "200字以内的剧情梗概",
         "tags": ["流派1", "关键词"],
         "characters": [
             {{
@@ -640,17 +361,11 @@ def analyze_book_metadata_deep_ai(engine, book_title, full_text):
                 "cheat_ability": "金手指/能力",
                 "power_level": "实力等级",
                 "appearance_features": "外貌特征",
-                "debts_and_feuds": "恩怨情仇",
-                "avatar_kw": "English keywords for painting"
+                "debts_and_feuds": "恩怨情仇"
             }}
         ],
         "relations": [
-            {{ 
-                "char1": "角色A(必须与character.name完全一致)", 
-                "char2": "角色B", 
-                "desc": "关系描述",
-                "detail": "详细起因缘由（如：在第3章中因为争夺宝物结仇）"
-            }}
+            {{ "char1": "角色A", "char2": "角色B", "desc": "关系描述" }}
         ],
         "world_settings": [
             {{ "category": "PowerSystem", "title": "境界划分", "content": "详细内容" }}
@@ -666,55 +381,75 @@ def analyze_book_metadata_deep_ai(engine, book_title, full_text):
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.5,
-            "max_tokens": 4000
+            "max_tokens": 4000 # 增加 Token 限制，防止截断
         }
+        # 尝试启用 JSON mode
         try:
             if "deepseek" in model_name.lower() or "gpt" in model_name.lower():
                 kwargs["response_format"] = {"type": "json_object"}
-        except: pass
+        except:
+            pass
 
         response = client.chat.completions.create(**kwargs)
         content = response.choices[0].message.content.strip()
         usage = response.usage.total_tokens if response.usage else 0
         
         print(f"DEBUG - AI Response Length: {len(content)}") 
+
         parsed_data = extract_and_parse_json(content)
         
         if not parsed_data:
             print(f"❌ JSON 解析失败，完整内容前500字符: {content[:500]}")
-            # 这里不直接返回 None，而是尝试让外层处理空数据
-            
+
         record_token_usage("OpenAI", model_name, usage, f"导入分析(智能版)-《{book_title}》", book_title)
         return parsed_data, usage
     except Exception as e:
-        log_audit_event("书籍导入", "AI分析失败", {"错误信息": str(e)}, status="ERROR")
+        log_operation("AI分析", f"分析失败：{e}")
         print(f"AI Error: {e}")
         return None, 0
 
 def generate_structure_via_ai_v2(engine, title, intro, genre_list, status_callback=None, target_chapter_count=50):
-    if isinstance(genre_list, list): genre_str = ", ".join(genre_list)
-    else: genre_str = str(genre_list)
+    """
+    生成书籍结构 (新增 target_chapter_count 参数)
+    """
+    if isinstance(genre_list, list): 
+        genre_str = ", ".join(genre_list)
+    else: 
+        genre_str = str(genre_list)
 
     assignments = engine.get_config_db("model_assignments", {})
     assigned_key = assignments.get("novel_structure_gen") or assignments.get("books_arch_gen") or "GPT_4o"
-    client, model_name, _ = _resolve_ai_client(engine, assigned_key)
+    client, model_name, _ = engine.get_client(assigned_key)
     
-    if not client: return False, f"⚠️ 未配置 AI 模型 (Key: {assigned_key})", {}, None
+    if not client: 
+        return False, f"⚠️ 未配置 AI 模型 (Key: {assigned_key})", {}, None
 
+    # 🔥 【核心配置】针对 DeepSeek 开启 8k 上下文
     base_max_tokens = 4000
-    if model_name and "deepseek" in model_name.lower(): base_max_tokens = 8000
+    if "deepseek" in model_name.lower():
+        base_max_tokens = 8000
 
-    final_data = { "characters": [], "relations": [], "world_settings": [], "structure": [] }
+    final_data = { 
+        "characters": [], 
+        "relations": [], 
+        "world_settings": [], 
+        "structure": [] 
+    }
     total_tokens = 0
 
     try:
-        # Step 1: 力量体系
-        if status_callback: status_callback(f"⚔️ Step 1/6: 构建独创的力量/科技体系...", 5)
+        # ======================================================================
+        # Step 1: 力量体系 (独立生成，避免干扰)
+        # ======================================================================
+        if status_callback: 
+            status_callback(f"⚔️ Step 1/6: 构建独创的力量/科技体系...", 5)
         
         prompt_power = f"""
         你是一位【{genre_str}】网文主编。请为《{title}》设计**核心升级体系**。
         简介："{intro}"
-        要求：所有内容使用简体中文。
+        要求：
+        1. 设定要有新意，包含具体的等级名称、晋升条件、核心资源。
+        2. 必须包含“代价”或“风险”设定。
         
         返回 JSON：
         {{ "world_settings": [ {{ "category": "PowerSystem", "title": "...", "content": "..." }} ] }}
@@ -723,20 +458,15 @@ def generate_structure_via_ai_v2(engine, title, intro, genre_list, status_callba
         power_context_str = ""
         try:
             res_p = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt_power}], temperature=0.7, max_tokens=2500
+                model=model_name, messages=[{"role": "user", "content": prompt_power}], 
+                temperature=0.7, max_tokens=2500
             )
             if hasattr(res_p, 'usage'): total_tokens += res_p.usage.total_tokens
             data_p = extract_and_parse_json(res_p.choices[0].message.content)
             
-            # 🔥 容错：如果AI直接返回了 {title:..., content:...} 而不是 world_settings 列表
             settings = []
-            if isinstance(data_p, dict):
-                if "world_settings" in data_p:
-                    settings = data_p.get("world_settings", [])
-                else:
-                    settings = [data_p]
-            elif isinstance(data_p, list):
-                settings = data_p
+            if isinstance(data_p, dict): settings = data_p.get("world_settings", [])
+            elif isinstance(data_p, list): settings = data_p
             
             if settings:
                 final_data["world_settings"].extend(settings)
@@ -744,19 +474,28 @@ def generate_structure_via_ai_v2(engine, title, intro, genre_list, status_callba
         except Exception as e:
             print(f"Power step error: {e}")
 
-        # Step 2: 地理与势力
-        if status_callback: status_callback(f"🌍 Step 2/6: 完善世界格局与势力斗争...", 15)
+        # ======================================================================
+        # Step 2: 地理与势力 (基于力量体系)
+        # ======================================================================
+        if status_callback: 
+            status_callback(f"🌍 Step 2/6: 完善世界格局与势力斗争...", 15)
+        
         prompt_geo = f"""
         基于力量体系：{power_context_str[:1000]}
         简介："{intro}"
-        请完善世界观：1. Geography(地理) 2. Organization(势力)。
-        ⚠️ 要求：所有内容必须是简体中文。
-        返回 JSON：{{ "world_settings": [ ... ] }}
+        请完善世界观：
+        1. **Geography (地理)**: 核心地图板块。
+        2. **Organization (势力)**: 设计 3-4 个互相制衡或敌对的势力（正邪、朝堂、公会）。
+        
+        返回 JSON：
+        {{ "world_settings": [ ... ] }}
         """
+        
         world_context_str = power_context_str
         try:
             res_g = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt_geo}], temperature=0.8, max_tokens=3000
+                model=model_name, messages=[{"role": "user", "content": prompt_geo}], 
+                temperature=0.8, max_tokens=3000
             )
             if hasattr(res_g, 'usage'): total_tokens += res_g.usage.total_tokens
             data_g = extract_and_parse_json(res_g.choices[0].message.content)
@@ -768,130 +507,197 @@ def generate_structure_via_ai_v2(engine, title, intro, genre_list, status_callba
             if settings:
                 final_data["world_settings"].extend(settings)
                 world_context_str = json.dumps(final_data["world_settings"], ensure_ascii=False)
-        except Exception as e: print(f"World step error: {e}")
+        except Exception as e:
+            print(f"World step error: {e}")
 
-        # Step 3: 核心双雄
-        if status_callback: status_callback(f"👤 Step 3/6: 深度刻画主角与宿敌...", 30)
+        # ======================================================================
+        # Step 3: 核心双雄 (主角与宿敌 - 深度刻画)
+        # ======================================================================
+        if status_callback: 
+            status_callback(f"👤 Step 3/6: 深度刻画主角与宿敌 (注入人性灰度)...", 30)
         
         char_schema = """
-        字段要求(必须简体中文)：
+        字段要求：
         - name: 姓名
-        - role: "主角" 或 "反派"
-        - gender: "男" 或 "女" (必填)
-        - origin: 出身
-        - profession: 身份
-        - cheat_ability: 金手指
-        - personality_flaw: 性格缺陷
-        - debts_and_feuds: 恩怨
-        - avatar_kw: English keywords only
+        - role: "主角" 或 "最终反派/宿敌"
+        - gender: 性别
+        - origin: 出身 (家族/宗门/过去)
+        - profession: 表面身份
+        - cheat_ability: 金手指/核心能力 (具体机制 + 代价)
+        - personality_flaw: **性格缺陷** (如贪婪、傲慢、社恐、偏执)
+        - hidden_agenda: **隐藏目的/秘密** (剧情钩子)
+        - speech_style: 说话风格 (如"冷嘲热讽", "文绉绉")
+        - avatar_kw: 英文绘画关键词
         """
         
         prompt_core_chars = f"""
         基于世界观：{world_context_str[:1200]}
         简介："{intro}"
-        请设计 2 名核心角色。
-        ⚠️ **所有字段值必须为中文(avatar_kw除外)，gender必须为男或女**。
+        
+        请设计 **2 名核心角色** (主角 + 核心反派/宿敌)。
+        要求：
+        1. 两人必须有**深层的利益冲突或理念分歧**。
+        2. 拒绝脸谱化，反派要有魅力，主角要有阴暗面或弱点。
+        
         {char_schema}
+        
         返回 JSON：{{ "characters": [ ... ] }}
         """
         
         core_chars = []
         try:
             res_c1 = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt_core_chars}], temperature=0.85, max_tokens=base_max_tokens
+                model=model_name, messages=[{"role": "user", "content": prompt_core_chars}], 
+                temperature=0.85, max_tokens=base_max_tokens # 8k tokens
             )
             if hasattr(res_c1, 'usage'): total_tokens += res_c1.usage.total_tokens
             data_c1 = extract_and_parse_json(res_c1.choices[0].message.content)
             
             if isinstance(data_c1, dict): core_chars = data_c1.get("characters", [])
             elif isinstance(data_c1, list): core_chars = data_c1
+            
             if core_chars: final_data["characters"].extend(core_chars)
-        except Exception as e: print(f"Core Char error: {e}")
+        except Exception as e:
+            print(f"Core Char error: {e}")
 
-        # Step 4: 重要配角
-        if status_callback: status_callback(f"👥 Step 4/6: 补充关键配角...", 50)
-        existing_names = [c.get('name', 'unknown') for c in final_data["characters"] if isinstance(c, dict)]
+        # ======================================================================
+        # Step 4: 重要配角 (扩展角色库)
+        # ======================================================================
+        if status_callback: 
+            status_callback(f"👥 Step 4/6: 补充 4-6 名关键配角 (丰富群像)...", 50)
+        
+        existing_names = [c['name'] for c in final_data["characters"] if 'name' in c]
         
         prompt_sub_chars = f"""
         基于主角与反派：{", ".join(existing_names)}
-        请额外设计 4-6 名重要配角。
-        ⚠️ **所有字段值必须为中文(avatar_kw除外)，gender必须为男或女**。
+        请额外设计 **4-6 名重要配角** (如：主角的引路人、反派的军师、亦敌亦友的竞争者、关键道具持有者)。
+        
+        要求：
+        1. 每个角色都必须与主角或反派有直接关联。
+        2. 包含字段：name, role, origin, profession, cheat_ability, personality_flaw, debts_and_feuds (恩怨), avatar_kw.
+        
         返回 JSON：{{ "characters": [ ... ] }}
         """
+        
         try:
             res_c2 = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt_sub_chars}], temperature=0.85, max_tokens=base_max_tokens
+                model=model_name, messages=[{"role": "user", "content": prompt_sub_chars}], 
+                temperature=0.85, max_tokens=base_max_tokens
             )
             if hasattr(res_c2, 'usage'): total_tokens += res_c2.usage.total_tokens
             data_c2 = extract_and_parse_json(res_c2.choices[0].message.content)
+            
             sub_chars = []
             if isinstance(data_c2, dict): sub_chars = data_c2.get("characters", [])
             elif isinstance(data_c2, list): sub_chars = data_c2
+            
             if sub_chars: final_data["characters"].extend(sub_chars)
-        except Exception as e: print(f"Sub Char error: {e}")
+        except Exception as e:
+            print(f"Sub Char error: {e}")
 
+        # ======================================================================
         # Step 5: 人物关系网
-        if status_callback: status_callback(f"🕸️ Step 5/6: 编织人物关系网...", 65)
-        all_names = [c.get('name', '') for c in final_data["characters"] if isinstance(c, dict) and 'name' in c]
+        # ======================================================================
+        if status_callback: 
+            status_callback(f"🕸️ Step 5/6: 编织复杂的人物关系网...", 65)
+        
+        all_names = [c['name'] for c in final_data["characters"] if 'name' in c]
         
         prompt_rel = f"""
         角色列表：{", ".join(all_names)}
-        请生成 10-15 组人物关系。
-        ⚠️ **char1 和 char2 必须从上述角色列表中选择，使用完全一致的姓名**。
-        ⚠️ **每个关系必须包含简短描述(desc)和详细描述(detail)**
-        格式：{{ "relations": [ {{ "char1": "A", "char2": "B", "desc": "简短中文描述", "detail": "详细起因缘由，包括发生的事件、章节、原因等" }} ] }}
+        请生成 **10-15 组** 人物关系。
+        要求：不要只写“朋友/敌人”，要具体。例如“表面师徒实则利用”、“因争夺某物结仇”。
+        格式：{{ "relations": [ {{ "char1": "A", "char2": "B", "desc": "..." }} ] }}
         """
+        
         try:
             res_r = client.chat.completions.create(
-                model=model_name, messages=[{"role": "user", "content": prompt_rel}], temperature=0.7, max_tokens=2000
+                model=model_name, messages=[{"role": "user", "content": prompt_rel}], 
+                temperature=0.7, max_tokens=2000
             )
             if hasattr(res_r, 'usage'): total_tokens += res_r.usage.total_tokens
             data_r = extract_and_parse_json(res_r.choices[0].message.content)
-            if isinstance(data_r, dict): final_data["relations"] = data_r.get("relations", [])
+            
+            if isinstance(data_r, dict):
+                final_data["relations"] = data_r.get("relations", [])
         except: pass
 
-        # Step 6: 分批生成大纲
+        # ======================================================================
+        # Step 6: 分批生成大纲 (支持手动指定数量，每10章一切)
+        # ======================================================================
         all_chapters = []
         prev_summary = "故事开始。"
+        
+        # 简化上下文，只传名字和简介，防止 Token 爆炸
         lite_char_context = ", ".join(all_names[:6])
+        
+        # 计算需要循环多少次 (向上取整)
         num_batches = (target_chapter_count + 9) // 10
         
         for i in range(num_batches): 
             start_c = i * 10 + 1
+            # 确保结束章节不超过目标总数
             end_c = min((i + 1) * 10, target_chapter_count)
+            
             if status_callback: 
+                # 动态计算进度百分比：基础70% + (当前批次 / 总批次) * 剩余25%
                 current_batch_progress = (i / num_batches) * 25
                 status_callback(f"📝 Step 6/6: 正在构思第 {start_c}-{end_c} 章 (进度 {i+1}/{num_batches})...", 70 + int(current_batch_progress))
             
             prompt_outline = f"""
             小说：《{title}》
+            类型：{genre_str}
             核心角色：{lite_char_context}
             前情概要：{prev_summary}
-            任务：生成第 {start_c} - {end_c} 章大纲。
-            ⚠️ **所有内容必须为简体中文**。
-            返回 JSON：{{ "chapters": [ {{ "title": "...", "summary": "..." }}, ... ] }}
+            
+            任务：请生成 **第 {start_c} 章 到 第 {end_c} 章** 的大纲。
+            要求：
+            1. 剧情紧凑，包含冲突和反转。
+            2. 必须体现主角的金手指运用和性格弱点带来的麻烦。
+            3. 每章 title (标题), summary (80-100字内容)。
+            
+            返回 JSON：
+            {{ "chapters": [ {{ "title": "...", "summary": "..." }}, ... ] }}
             """
+            
             try:
                 res_out = client.chat.completions.create(
-                    model=model_name, messages=[{"role": "user", "content": prompt_outline}], temperature=0.8, max_tokens=base_max_tokens
+                    model=model_name, messages=[{"role": "user", "content": prompt_outline}], 
+                    temperature=0.8, max_tokens=base_max_tokens # 8k for DeepSeek
                 )
                 if hasattr(res_out, 'usage'): total_tokens += res_out.usage.total_tokens
                 data_out = extract_and_parse_json(res_out.choices[0].message.content)
+                
                 new_chaps = []
                 if isinstance(data_out, dict): new_chaps = data_out.get("chapters", [])
                 elif isinstance(data_out, list): new_chaps = data_out
+                
                 if new_chaps:
                     all_chapters.extend(new_chaps)
-                    last_sums = [c.get('summary','') for c in new_chaps[-2:] if isinstance(c, dict)]
+                    # 更新前情摘要，只取最后 2 章的摘要作为下一轮的输入
+                    last_sums = [c.get('summary','') for c in new_chaps[-2:]]
                     prev_summary = f"第{end_c}章结束。近期剧情：{' '.join(last_sums)}"
-                time.sleep(0.5)
-            except Exception as e: print(f"Outline batch {i} error: {e}")
+                
+                time.sleep(0.5) # 避免触发 API 速率限制
+                
+            except Exception as e:
+                print(f"Outline batch {i} error: {e}")
 
+        # 构建最终结构
         if all_chapters:
-            final_data["structure"] = [{ "part_name": "第一卷", "volumes": [{ "vol_name": "正文", "chapters": all_chapters }] }]
+            final_data["structure"] = [{ 
+                "part_name": "第一卷：风起萍末", 
+                "volumes": [{ 
+                    "vol_name": "正文", 
+                    "chapters": all_chapters 
+                }] 
+            }]
         
-        if status_callback: status_callback("✅ 架构生成完毕，写入数据库...", 98)
+        if status_callback: 
+            status_callback("✅ 架构生成完毕，写入数据库...", 98)
+        
         record_token_usage("OpenAI", model_name, total_tokens, f"架构生成-《{title}》", title)
+        
         return True, final_data, {'total_tokens': total_tokens}, assigned_key
 
     except Exception as e:
@@ -900,53 +706,35 @@ def generate_structure_via_ai_v2(engine, title, intro, genre_list, status_callba
 def _write_ai_characters(db_mgr, book_id, chars):
     if not chars: return 0
     n_chars = 0
-    # 🔥 修复：使用纯 URL 字符串
     dicebear_base = "https://api.dicebear.com/9.x/adventurer/svg?seed="
     
     for char in chars:
         if not isinstance(char, dict): continue
         
-        # 🔥 名字清洗
-        name = _safe_clean_text(char.get('name', '')).strip()
-        if not name or name == "未命名": continue
+        name = char.get('name', '未命名')
+        if not name: continue
         
-        role = _safe_clean_text(char.get('role', '配角'))
+        role = char.get('role', '配角')
+        gender = char.get('gender', '未知')
+        race = char.get('race', '人族')
+        desc = char.get('desc', '')
         
-        # 🔥 性别智能修正
-        raw_gender = str(char.get('gender', ''))
-        gender = '未知'
-        if '男' in raw_gender: gender = '男'
-        elif '女' in raw_gender: gender = '女'
-        
-        race = _safe_clean_text(char.get('race', '人族'))
-        desc = _safe_clean_text(char.get('desc', ''))
-        
-        # 头像处理
-        avatar_kw = char.get('avatar_kw', '') 
-        # 如果 avatar_kw 是字典，只取值
-        if isinstance(avatar_kw, dict): 
-            avatar_kw = " ".join([str(v) for v in avatar_kw.values()])
-            
-        if not avatar_kw: avatar_kw = f"{name} fantasy style"
-        
+        avatar_kw = char.get('avatar_kw', '') or f"{name} fantasy style"
         if name in avatar_kw: search_query = avatar_kw
         else: search_query = f"{name} {avatar_kw}"
-        
         avatar_url = generate_bing_search_image(search_query) 
-        if not avatar_url: 
-            avatar_url = f"{dicebear_base}{urllib.parse.quote(name)}&flip=true"
+        if not avatar_url: avatar_url = f"{dicebear_base}{urllib.parse.quote(name)}&flip=true"
 
-        # 🔥 使用 _safe_clean_text 清洗所有字段，防止写入 JSON 字符串
-        origin = _safe_clean_text(char.get('origin', '未知'))
-        profession = _safe_clean_text(char.get('profession', '无'))
-        cheat_ability = _safe_clean_text(char.get('cheat_ability', '无'))
-        power_level = _safe_clean_text(char.get('power_level', '未知'))
-        ability_limitations = _safe_clean_text(char.get('ability_limitations', '无'))
-        appearance_features = _safe_clean_text(char.get('appearance_features', ''))
-        signature_sign = _safe_clean_text(char.get('signature_sign', ''))
-        relationship_to_protagonist = _safe_clean_text(char.get('relationship_to_protagonist', '未知'))
-        social_role = _safe_clean_text(char.get('social_role', ''))
-        debts_and_feuds = _safe_clean_text(char.get('debts_and_feuds', ''))
+        origin = char.get('origin', '未知')
+        profession = char.get('profession', '无')
+        cheat_ability = char.get('cheat_ability', '无')
+        power_level = char.get('power_level', '未知')
+        ability_limitations = char.get('ability_limitations', '无')
+        appearance_features = char.get('appearance_features', '')
+        signature_sign = char.get('signature_sign', '')
+        relationship_to_protagonist = char.get('relationship_to_protagonist', '未知')
+        social_role = char.get('social_role', '')
+        debts_and_feuds = char.get('debts_and_feuds', '')
 
         if not desc:
             desc = f"【身份】{origin}，{profession}。\n【外貌】{appearance_features}。\n【能力】{cheat_ability}（{power_level}）。"
@@ -966,8 +754,6 @@ def _write_ai_characters(db_mgr, book_id, chars):
             )
             n_chars += 1
         except Exception as e:
-            print(f"Insert char error: {e}")
-            # 降级插入
             try:
                 db_mgr.execute(
                     "INSERT INTO characters (book_id, name, role, gender, race, desc, is_major, avatar) VALUES (?,?,?,?,?,?,?,?)",
@@ -979,6 +765,41 @@ def _write_ai_characters(db_mgr, book_id, chars):
 
     return n_chars
 
+def _write_ai_relations(db_mgr, book_id, relations, char_map):
+    if not relations: return 0
+    n_rels = 0
+    clean_relations = []
+    
+    normalized_map = {}
+    for name, cid in char_map.items():
+        norm_name = name.strip().lower()
+        normalized_map[norm_name] = cid
+        if "(" in norm_name: normalized_map[norm_name.split('(')[0]] = cid
+    
+    for rel in relations:
+        if not isinstance(rel, dict): continue
+        char1 = rel.get('char1', '').strip()
+        char2 = rel.get('char2', '').strip()
+        desc = rel.get('desc', '关联')
+        if not char1 or not char2: continue
+
+        c1_id = normalized_map.get(char1.lower())
+        c2_id = normalized_map.get(char2.lower())
+        
+        if not c1_id:
+            for k, v in normalized_map.items(): 
+                if char1.lower() in k or k in char1.lower(): c1_id = v; break
+        if not c2_id:
+            for k, v in normalized_map.items():
+                if char2.lower() in k or k in char2.lower(): c2_id = v; break
+
+        if c1_id and c2_id and c1_id != c2_id:
+            clean_relations.append({"source": c1_id, "target": c2_id, "label": desc, "weight": 3})
+            n_rels += 1
+            
+    save_relations_to_disk(book_id, clean_relations)
+    return n_rels
+
 def _write_ai_structure(db_mgr, book_id, structure):
     n_chaps = 0
     if not structure: return 0
@@ -986,59 +807,72 @@ def _write_ai_structure(db_mgr, book_id, structure):
 
     for p_idx, part in enumerate(structure):
         if not isinstance(part, dict): continue
-        p_name = _safe_clean_text(part.get('part_name', f'第{p_idx+1}篇'))
+        p_name = part.get('part_name', f'第{p_idx+1}篇')
         part_id = db_mgr.execute("INSERT INTO parts (book_id, name, sort_order) VALUES (?,?,?)", (book_id, p_name, (p_idx+1)*100))
         
         volumes = part.get('volumes', [])
         for v_idx, vol in enumerate(volumes):
             if not isinstance(vol, dict): continue
-            v_name = _safe_clean_text(vol.get('vol_name', f'第{v_idx+1}卷'))
+            v_name = vol.get('vol_name', f'第{v_idx+1}卷')
             vol_id = db_mgr.execute("INSERT INTO volumes (book_id, part_id, name, sort_order) VALUES (?,?,?,?)", (book_id, part_id, v_name, (v_idx+1)*100))
             raw_chapters = vol.get('chapters', [])
             for c_idx, chap in enumerate(raw_chapters):
-                if isinstance(chap, dict):
-                    c_title = _safe_clean_text(chap.get('title', f"第{c_idx+1}章"))
-                    c_summary = _safe_clean_text(chap.get('summary', ""))
-                else:
-                    c_title = str(chap)
-                    c_summary = ""
-                
+                c_title = chap.get('title', f"第{c_idx+1}章") if isinstance(chap, dict) else str(chap)
+                c_summary = chap.get('summary', "") if isinstance(chap, dict) else ""
                 db_mgr.execute("INSERT INTO chapters (volume_id, title, content, summary, sort_order) VALUES (?,?,?,?,?)",
                     (vol_id, c_title, "", c_summary, c_idx+1))
                 n_chaps += 1
     return n_chaps
 
 def _process_ai_generated_data(db_mgr, engine, book_id, res_data, book_title, book_category):
+    """
+    处理AI生成的数据，增强容错性
+    """
     # 🛡️ 容错核心：确保 res_data 是字典
     if isinstance(res_data, list):
         if len(res_data) > 0 and isinstance(res_data[0], dict):
+             # 尝试合并列表中的字典
              merged = {}
              for item in res_data:
                  if isinstance(item, dict): merged.update(item)
              res_data = merged
-        else: res_data = {}
+        else:
+             res_data = {}
     
-    if not isinstance(res_data, dict): res_data = {}
+    if not isinstance(res_data, dict):
+        print(f"Warning: res_data is not a dict, got {type(res_data)}")
+        res_data = {}
     
+    # 辅助函数，用于模糊匹配键名
     def get_robust_list(data, possible_keys):
         for k in possible_keys:
-            if k in data and isinstance(data[k], list): return data[k]
+            if k in data and isinstance(data[k], list):
+                return data[k]
         return []
 
+    # 处理角色数据 (支持多种键名)
     char_keys = ['characters', 'Characters', 'roles', 'chars', '角色列表', '人物']
     characters = get_robust_list(res_data, char_keys)
+    
+    if not characters:
+        print(f"⚠️ 未提取到角色数据，当前Keys: {res_data.keys()}")
+    
     n_chars = _write_ai_characters(db_mgr, book_id, characters)
     
-    # 重新查询 ID 映射，确保能够正确连线
+    # 获取角色映射
     char_map_res = db_mgr.query("SELECT name, id FROM characters WHERE book_id=?", (book_id,))
     char_map = {r['name']: r['id'] for r in char_map_res}
     
+    # 处理关系数据
     rel_keys = ['relations', 'Relations', 'relationships', 'relationship', '人物关系', '关系']
     relations = get_robust_list(res_data, rel_keys)
+    
     n_rels = _write_ai_relations(db_mgr, book_id, relations, char_map)
     
+    # 处理世界观设定
     setting_keys = ['world_settings', 'WorldSettings', 'settings', 'world', '世界观', '设定']
     world_settings = get_robust_list(res_data, setting_keys)
+    
     n_settings = _write_detailed_world_settings(db_mgr, book_id, world_settings)
     
     return n_chars, n_rels, n_settings
@@ -1174,7 +1008,7 @@ def _parse_book_structure(full_text):
 
     if total_chaps < 5 and len(full_text) > 50000:
         print("⚠️ 触发暴力分章模式...")
-        log_audit_event("书籍导入", "触发暴力分章", "检测到章节数过少，自动切换模式", status="WARNING")
+        log_operation("解析", "触发暴力分章模式")
         
         fallback_structure = [{'part_name': '正文', 'volumes': [{'vol_name': '全书', 'chapters': []}]}]
         target_vol = fallback_structure[0]['volumes'][0]
@@ -1257,7 +1091,9 @@ def _import_book_process(db_mgr, engine, uploaded_file, book_id, book_title, boo
             status.write("💾 正在写入数据库...")
             curr = 0; current_prog = 60.0
             for p_idx, part in enumerate(structure):
+                # 🛠️ 修复核心：INSERT INTO parts 只接受3个参数 (book_id, name, sort_order)
                 part_id = db_mgr.execute("INSERT INTO parts (book_id, name, sort_order) VALUES (?,?,?)", (book_id, part['part_name'], (p_idx+1)*100))
+
                 for v_idx, vol in enumerate(part['volumes']):
                     vol_id = db_mgr.execute("INSERT INTO volumes (book_id, part_id, name, sort_order) VALUES (?,?,?,?)", (book_id, part_id, vol['vol_name'], (v_idx+1)*100))
                     for c_idx, chap in enumerate(vol['chapters']):
@@ -1273,18 +1109,11 @@ def _import_book_process(db_mgr, engine, uploaded_file, book_id, book_title, boo
             db_mgr.execute("UPDATE books SET updated_at=? WHERE id=?", (get_beijing_time(), book_id))
             
             status.update(label=f"🎉 导入成功！共 {n_chaps} 章", state="complete", expanded=False)
-            
-            log_audit_event("书籍导入", "导入成功", {
-                "书籍": book_title, 
-                "作者": book_author, 
-                "总字数": len(full_text), 
-                "章节数": n_chaps
-            })
-            
+            log_operation("书籍导入", f"成功导入《{book_title}》，共 {n_chaps} 章")
             return n_chaps, n_chars, n_rels, n_settings, detected_tags, usage_info
 
     except Exception as e:
-        log_audit_event("书籍导入", "导入致命错误", {"错误信息": str(e)}, status="ERROR")
+        log_operation("书籍导入", f"导入致命错误: {e}")
         st.error(f"导入出错: {e}")
         return 0, 0, 0, 0, [], {}
 
@@ -1296,23 +1125,32 @@ def _import_book_process(db_mgr, engine, uploaded_file, book_id, book_title, boo
 def dialog_add_custom_genre():
     st.markdown("请输入新的流派名称：")
     db_mgr = st.session_state.db
+    
     new_genre = st.text_input("流派名称", key="input_custom_genre_modal")
     
-    if st.button("确认添加", type="primary", width="stretch"):
+    if st.button("确认添加", type="primary", use_container_width=True):
         val = new_genre.strip()
         if val:
+            # 1. 查重
             existing = db_mgr.query("SELECT id FROM categories WHERE name=?", (val,))
+            
             if not existing:
                 try:
+                    # 2. 写入数据库
                     db_mgr.execute("INSERT INTO categories (name) VALUES (?)", (val,))
-                    log_audit_event("基础配置", "添加流派", {"流派名称": val})
                     
+                    # 🔥 3. 【核心修复】强制更新 Session State (使用列表拼接赋值，触发重绘)
                     ms_key = "new_book_selected_genres"
-                    current_selection = st.session_state.get(ms_key, [])
-                    if not isinstance(current_selection, list): current_selection = []
                     
+                    # 确保Key存在
+                    current_selection = st.session_state.get(ms_key, [])
+                    if not isinstance(current_selection, list):
+                        current_selection = []
+                    
+                    # 如果当前未选中，则添加并重新赋值
                     if val not in current_selection:
                         st.session_state[ms_key] = current_selection + [val]
+                        print(f"DEBUG: Updated session state {ms_key} to {st.session_state[ms_key]}")
                     
                     st.success(f"✅ 已添加并选中：{val}")
                     time.sleep(0.5)
@@ -1341,12 +1179,12 @@ def show_import_report_modal(data):
     if usage_info and 'total_tokens' in usage_info:
         st.caption(f"Tokens 消耗: {usage_info.get('total_tokens', 0)}")
     
-    if st.button("开始写作", type="primary", width="stretch"):
+    if st.button("开始写作", type="primary", use_container_width=True):
         if 'import_report_data' in st.session_state: del st.session_state['import_report_data']
         st.session_state.current_book_id = book_id
         st.session_state.current_menu = "write"
         st.rerun()
-    if st.button("关闭", type="secondary", width="stretch"):
+    if st.button("关闭", type="secondary", use_container_width=True):
         if 'import_report_data' in st.session_state: del st.session_state['import_report_data']
         st.rerun()
 
@@ -1418,7 +1256,7 @@ def render_import_section(engine):
             title_input = c1.text_input("书名", value=default_title)
             author_input = c2.text_input("作者", value="未知")
             genre_hint = st.text_input("📚 辅助关键词 (让 AI 更懂这本小说)", placeholder="例如：玄幻, 退婚流, 斗气")
-            submitted = st.form_submit_button("🚀 开始导入", type="primary", width="stretch")
+            submitted = st.form_submit_button("🚀 开始导入", type="primary", use_container_width=True)
         
         if submitted:
             if not uploaded_file: st.error("请先上传文件")
@@ -1441,6 +1279,11 @@ def render_import_section(engine):
                     st.error(f"导入错误: {e}")
 
 def render_book_card(book):
+    """
+    书籍卡片渲染 (修复版)
+    移除有缺陷的日期对比纠偏逻辑，直接显示时间。
+    一旦使用新的 get_beijing_time 写入数据库，显示即会正常。
+    """
     book = dict(book)
     bid = book['id']
     book_title = book['title']
@@ -1450,9 +1293,11 @@ def render_book_card(book):
     genre_list = [c['name'] for c in book_categories]
     genre_value = " / ".join(genre_list) if genre_list else '未分类'
     
+    # 格式化时间字符串，去掉毫秒
     raw_c_time = str(book.get('created_at', '')).replace('T', ' ').split('.')[0]
     raw_u_time = str(book.get('updated_at', '')).replace('T', ' ').split('.')[0]
     
+    # 截取文件名用于缓存检查
     file_path = get_cached_file_path(bid, book_title)
     size_label = None
     if os.path.exists(file_path):
@@ -1472,6 +1317,7 @@ def render_book_card(book):
         with c_head_R:
             if size_label: st.markdown(f"<div style='text-align: right; color: #888; font-size: 12px; margin-top: 5px;'>📦 {size_label}</div>", unsafe_allow_html=True)
         
+        # 移除了 faulty 的自动纠偏逻辑，直接显示
         st.markdown(f"""
         <div style='height: 90px; overflow-y: hidden; font-size: 13px; color: #555; margin-bottom: 10px; border-bottom: 1px dashed #eee;'>
             <div style='margin-bottom: 2px;'><b>作者:</b> {book['author']}</div>
@@ -1484,22 +1330,32 @@ def render_book_card(book):
         st.markdown("<div style='height: 4px'></div>", unsafe_allow_html=True)
 
         c1, c2, c3, c4 = st.columns(4)
-        if c1.button("✍️ 写作", key=f"ent_{bid}", type="primary", width="stretch", help="进入写作模式"):
+        if c1.button("✍️ 写作", key=f"ent_{bid}", type="primary", use_container_width=True, help="进入写作模式"):
+            # 🔥 点击写作时，使用新的 get_beijing_time() 强制修复数据库中的时间
             db_mgr.execute("UPDATE books SET updated_at=? WHERE id=?", (get_beijing_time(), bid))
-            log_audit_event("写作模式", "进入写作", {"书籍": book['title'], "ID": bid})
             st.session_state.current_book_id = bid
             st.session_state.current_menu = "write"
+            
+            # 🔥 [关键修改]：只设置 Flag，不要在这里执行 JS，因为 st.rerun() 会打断它
             st.session_state.trigger_scroll_to_top = True 
+            
             st.rerun()
             
-        if c2.button("📑 预览", key=f"view_{bid}", width="stretch", help="查看章节列表"):
+        if c2.button("📑 预览", key=f"view_{bid}", use_container_width=True, help="查看章节列表"):
              st.session_state.current_book_id = bid; st.session_state.current_menu = "chapters"; st.rerun()
              
         with c3:
-            if st.button("📥 导出", key=f"dl_{bid}", width="stretch", help="导出最新内容到本地文件夹"):
+            # 🔥 修改：将"打包"和"导出"合并，直接生成最新内容
+            if st.button("📥 导出", key=f"dl_{bid}", use_container_width=True, help="导出最新内容到本地文件夹"):
                 try:
+                    # 总是重新生成最新内容
                     content = generate_book_content(db_mgr, bid)
-                    with open(file_path, "w", encoding='utf-8') as f: f.write(content)
+                    
+                    # 同时更新缓存文件
+                    with open(file_path, "w", encoding='utf-8') as f: 
+                        f.write(content)
+                    
+                    # 保存到本地
                     success, saved_path = save_file_locally(f"{book_title}.txt", content)
                     if success:
                         audit_download_callback(book_title, bid)
@@ -1507,10 +1363,9 @@ def render_book_card(book):
                 except Exception as e:
                     st.error(f"导出失败: {e}")
                     
-        if c4.button("🗑️ 删除", key=f"del_{bid}", width="stretch", help="永久删除"):
+        if c4.button("🗑️ 删除", key=f"del_{bid}", use_container_width=True, help="永久删除"):
             db_mgr.execute("DELETE FROM books WHERE id=?", (bid,))
             if os.path.exists(file_path): os.remove(file_path)
-            log_audit_event("书籍管理", "删除书籍", {"书籍": book['title'], "ID": bid}, status="WARNING")
             st.rerun()
 
 def render_books(engine):
@@ -1524,28 +1379,39 @@ def render_books(engine):
     render_header("📚", "书籍管理")
     render_import_section(engine) 
     
+    # 🗑️ 移除旧的缓存 List，直接依赖 DB 和 Key
+    
+    # 🔥 [修改] expanded=False 默认折叠
     with st.expander("✨ AI 架构向导 (从零开始)", expanded=False):
         with st.form("form_new_book"):
+            # 🔥 [UI 更新] 改为三列布局，增加“生成章节数”输入
             c_title, c_auth, c_num = st.columns([2, 1, 1])
             b_title = c_title.text_input("书名", placeholder="例如：诡秘之主")
             b_author = c_auth.text_input("作者", "我")
             b_target_chaps = c_num.number_input("生成章节数量", min_value=10, max_value=200, value=50, step=10, help="每10章为一个生成批次")
             
+            # 🔥 [修复关键]：每次渲染时，从数据库实时拉取最新的 Categories
             existing_cats_db = db_mgr.query("SELECT name FROM categories")
             db_cats = [c['name'] for c in existing_cats_db] if existing_cats_db else []
+            
+            # 合并：默认流派 + 数据库流派 -> 去重 -> 排序
             all_options = sorted(list(set(FLAT_GENRE_LIST + db_cats)))
             
+            # 🔥 [新增] 在渲染多选框前，确保 Session State 中 key 存在且类型正确
             ms_key = "new_book_selected_genres"
-            if ms_key not in st.session_state: st.session_state[ms_key] = []
+            if ms_key not in st.session_state:
+                st.session_state[ms_key] = []
             
+            # 🔥 [新增 key] 绑定 Session State，以便自动选中
             b_category = st.multiselect("流派", all_options, placeholder="选择流派...", key=ms_key)
             if st.form_submit_button("➕ 添加流派", type="secondary"): dialog_add_custom_genre()
 
             b_intro = st.text_area("简介 / 核心脑洞 (AI 生成依据)", height=150, placeholder="例如：穿越到异界，开局被退婚...")
             
             c_sub1, c_sub2 = st.columns([1, 4])
-            btn_create = c_sub1.form_submit_button("仅创建", width="stretch")
-            btn_create_gen = c_sub2.form_submit_button(f"🚀 启动 AI 架构师 (生成角色 + {b_target_chaps}章大纲)", type="primary", width="stretch")
+            btn_create = c_sub1.form_submit_button("仅创建", use_container_width=True)
+            # 🔥 [UI 更新] 按钮文本动态显示章节数
+            btn_create_gen = c_sub2.form_submit_button(f"🚀 启动 AI 架构师 (生成角色 + {b_target_chaps}章大纲)", type="primary", use_container_width=True)
             
             if btn_create or btn_create_gen:
                 if not b_title.strip():
@@ -1561,53 +1427,54 @@ def render_books(engine):
                         if b_category: process_and_save_tags(db_mgr, bid, b_category)
 
                         if btn_create_gen:
-                            log_audit_event("AI架构", "启动架构生成", {"书名": b_title, "目标章节": b_target_chaps})
-                            
                             status_container = st.status("🧠 AI 正在构思...", expanded=True)
                             progress_bar = status_container.progress(5)
                             def update_status(msg, p):
                                 status_container.write(msg)
                                 progress_bar.progress(p)
 
+                            # 🔥 [Logic 更新] 传入 target_chapter_count
                             ok, res_data, usage, _ = generate_structure_via_ai_v2(engine, b_title, b_intro, b_category, update_status, target_chapter_count=b_target_chaps)
                             
                             if ok:
                                 progress_bar.progress(95)
                                 status_container.write("💾 正在写入数据库...")
                                 
-                                # 🛡️ 容错处理
+                                # 🛡️ 容错处理：确保 AI 返回的是 Dict，如果是 List 则尝试恢复
                                 if isinstance(res_data, list):
                                      if len(res_data) > 0 and isinstance(res_data[0], dict):
                                           merged_data = {}
                                           for item in res_data:
                                               if isinstance(item, dict): merged_data.update(item)
                                           res_data = merged_data
-                                     else: res_data = {}
-                                if not isinstance(res_data, dict): res_data = {}
+                                     else:
+                                          res_data = {}
+                                
+                                if not isinstance(res_data, dict):
+                                     res_data = {}
 
                                 n_chars, n_rels, n_settings = _process_ai_generated_data(db_mgr, engine, bid, res_data, b_title, b_category)
+                                
+                                # 安全获取 structure
                                 struct_data = res_data.get('structure', [])
                                 n_chaps = _write_ai_structure(db_mgr, bid, struct_data)
                                 
                                 db_mgr.execute("UPDATE books SET updated_at=? WHERE id=?", (get_beijing_time(), bid))
                                 status_container.update(label="✅ 完成！", state="complete")
                                 
-                                log_audit_event("AI架构", "架构生成完成", {"书名": b_title, "ID": bid})
-                                
                                 st.session_state['import_report_data'] = {
                                     'title': b_title, 'chapters': n_chaps, 'chars': n_chars, 'relations': n_rels, 'settings': n_settings, 'tags': b_category, 'book_id': bid, 'usage': usage
                                 }
                                 time.sleep(1); st.rerun()
                             else:
-                                log_audit_event("AI架构", "架构生成失败", {"错误": str(res_data)}, status="ERROR")
                                 st.error(f"AI 生成失败: {res_data}")
                         else:
-                            log_audit_event("书籍管理", "新建书籍(手动)", {"书名": b_title})
                             st.toast("✅ 书籍已创建"); time.sleep(0.5); st.rerun()
                     except Exception as e:
                         st.error(f"操作失败: {e}")
                         if bid: db_mgr.execute("DELETE FROM books WHERE id=?", (bid,))
 
+    # 书籍列表
     books = db_mgr.query("SELECT * FROM books ORDER BY updated_at DESC")
     if books:
         for i in range(0, len(books), 2):
